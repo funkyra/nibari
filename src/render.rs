@@ -88,6 +88,23 @@ fn font_system(font_family: &str) -> FontSystem {
     }
 }
 
+const KEYBOARD_TASK_GAP: i32 = 2;
+
+fn task_right_edge(
+    right_content_left: i32,
+    task_spacing: i32,
+    scale: u32,
+    keyboard_width: i32,
+) -> i32 {
+    let scale = scale.max(1) as i32;
+    let keyboard_gap = if keyboard_width > 0 {
+        KEYBOARD_TASK_GAP * scale
+    } else {
+        0
+    };
+    right_content_left - task_spacing * scale - keyboard_gap
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Hitbox {
     pub tray_index: usize,
@@ -731,7 +748,12 @@ impl Renderer {
         } else {
             bar.clock_x
         };
-        let right = right_content_left - self.style.task_spacing as i32 * scale_i32;
+        let right = task_right_edge(
+            right_content_left,
+            self.style.task_spacing as i32,
+            scale,
+            bar.keyboard_width,
+        );
         let Some(layout) = TaskLayout::calculate(
             left,
             right,
@@ -1140,6 +1162,12 @@ mod tests {
             selected_font_paths([Some(std::path::PathBuf::from("/fonts/ui.ttf")), None]),
             None
         );
+    }
+
+    #[test]
+    fn tasks_leave_two_extra_pixels_before_keyboard_layout() {
+        assert_eq!(task_right_edge(400, 2, 1, 80), 396);
+        assert_eq!(task_right_edge(400, 2, 1, 0), 398);
     }
 
     #[test]

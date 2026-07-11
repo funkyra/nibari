@@ -1,0 +1,39 @@
+# ~/.config/nibari/config.toml
+
+height = 28
+font_family = "Fira Code Medium"
+font_size = 8.0
+
+# Цвета бара. Формат: #RRGGBB или #RRGGBBAA.
+background = "#282828"
+foreground = "#DCDCCC"
+
+padding = 8
+tray_icon_size = 18
+tray_spacing = 6
+
+# По 5 workspaces слева: 一–五 на первом output, 六–零 на втором.
+workspace_width = 28
+workspace_focused_background = "#3C3836"
+workspace_active_background = "#6F6F6F"
+workspace_active_foreground = "#F0DFAF"
+workspace_occupied_foreground = "#DCDCCC"
+workspace_empty_foreground = "#6F6F6F"
+workspace_urgent_foreground = "#CC9393"
+
+# Окна активного workspace в центре.
+task_icon_size = 18
+task_spacing = 2
+task_padding = 6
+task_background = "#282828"
+task_focused_background = "#3C3836"
+task_urgent_background = "#282828"
+task_foreground = "#DCDCCC"
+task_focused_foreground = "#F0DFAF"
+
+# Формат chrono/strftime.
+clock_format = "%a %b %d, %H:%M"
+
+# Если не задано, nibari попробует использовать текущую GTK icon theme,
+# затем hicolor.
+# icon_theme = "Papirus"

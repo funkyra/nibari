@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    process::Command,
-};
+use std::{collections::HashMap, path::PathBuf, process::Command};
 
 use cosmic_text::{
     Align, Attrs, Buffer, Color as TextColor, Family, FontSystem, Metrics, Shaping, SwashCache,
@@ -43,7 +39,10 @@ fn fontconfig_font_path(pattern: &str) -> Option<PathBuf> {
     {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
-            log::warn!("fc-match завершился с ошибкой для {pattern:?}: {}", output.status);
+            log::warn!(
+                "fc-match завершился с ошибкой для {pattern:?}: {}",
+                output.status
+            );
             return None;
         }
         Err(error) => {
@@ -74,13 +73,16 @@ fn font_system(font_family: &str) -> FontSystem {
         return FontSystem::new();
     };
     let mut database = cosmic_text::fontdb::Database::new();
-    if paths.into_iter().all(|path| match database.load_font_file(&path) {
-        Ok(()) => true,
-        Err(error) => {
-            log::warn!("не удалось загрузить шрифт {}: {error}", path.display());
-            false
-        }
-    }) {
+    if paths
+        .into_iter()
+        .all(|path| match database.load_font_file(&path) {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!("не удалось загрузить шрифт {}: {error}", path.display());
+                false
+            }
+        })
+    {
         FontSystem::new_with_locale_and_db("en-US".into(), database)
     } else {
         log::warn!("используется полная системная база шрифтов");
@@ -88,7 +90,7 @@ fn font_system(font_family: &str) -> FontSystem {
     }
 }
 
-const KEYBOARD_TASK_GAP: i32 = 2;
+const KEYBOARD_TASK_GAP: i32 = 4;
 
 fn task_right_edge(
     right_content_left: i32,

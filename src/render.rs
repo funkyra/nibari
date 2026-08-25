@@ -1167,8 +1167,8 @@ mod tests {
     }
 
     #[test]
-    fn tasks_leave_two_extra_pixels_before_keyboard_layout() {
-        assert_eq!(task_right_edge(400, 2, 1, 80), 396);
+    fn tasks_leave_four_extra_pixels_before_keyboard_layout() {
+        assert_eq!(task_right_edge(400, 2, 1, 80), 394);
         assert_eq!(task_right_edge(400, 2, 1, 0), 398);
     }
 

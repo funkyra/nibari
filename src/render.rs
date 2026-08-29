@@ -412,6 +412,10 @@ impl Renderer {
         }
     }
 
+    pub fn evict_task_text(&mut self, window_id: u64) {
+        self.task_text_cache.retain(|entry| entry.id != window_id);
+    }
+
     pub fn draw(
         &mut self,
         pixmap: &mut PixmapMut<'_>,
@@ -637,9 +641,8 @@ impl Renderer {
         let line_height = (font_size * 1.25).ceil();
         let metrics = Metrics::new(font_size, line_height);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        buffer.set_size(&mut self.font_system, Some(10_000.0), Some(line_height));
+        buffer.set_size(Some(10_000.0), Some(line_height));
         buffer.set_text(
-            &mut self.font_system,
             text,
             &Attrs::new().family(Family::Name(&self.style.font_family)),
             Shaping::Advanced,
@@ -1292,6 +1295,34 @@ mod tests {
         let last = layout.item(2).unwrap();
         assert_eq!(last.width, 29);
         assert_eq!(last.x + last.width, 103);
+    }
+
+    #[test]
+    fn task_text_eviction_removes_every_scale_and_keeps_capacity() {
+        let mut renderer = Renderer::new(&Config::default());
+        renderer.task_text_cache.reserve(8);
+        for (id, scale) in [(7, 1), (7, 2), (9, 1)] {
+            renderer.task_text_cache.push(TaskTextBitmap {
+                id,
+                label: format!("window-{id}"),
+                scale,
+                color: [255; 4],
+                pixmap: Pixmap::new(1, 1).unwrap(),
+            });
+        }
+        let capacity = renderer.task_text_cache.capacity();
+
+        renderer.evict_task_text(7);
+
+        assert_eq!(
+            renderer
+                .task_text_cache
+                .iter()
+                .map(|entry| (entry.id, entry.scale))
+                .collect::<Vec<_>>(),
+            [(9, 1)]
+        );
+        assert_eq!(renderer.task_text_cache.capacity(), capacity);
     }
 
     #[test]

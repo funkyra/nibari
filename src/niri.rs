@@ -181,6 +181,7 @@ impl WorkspaceModel {
 
 pub enum NiriEvent {
     State(Arc<NiriModel>),
+    WindowClosed(u64),
 }
 
 pub fn spawn(events: UiSender<NiriEvent>, config: &Config) {
@@ -216,6 +217,10 @@ fn listen(events: &UiSender<NiriEvent>, icons: &mut ApplicationIconCache) -> any
     loop {
         let event = read_event()?;
         let relevant = affects_workspace_view(&event);
+        notify_window_closures(&state, &event, |id| {
+            events.send(NiriEvent::WindowClosed(id))?;
+            Ok(())
+        })?;
         let _ = state.apply(event);
         if relevant {
             let next = Arc::new(niri_model(&state, icons));
@@ -225,6 +230,25 @@ fn listen(events: &UiSender<NiriEvent>, icons: &mut ApplicationIconCache) -> any
             }
         }
     }
+}
+
+fn notify_window_closures(
+    state: &EventStreamState,
+    event: &Event,
+    mut notify: impl FnMut(u64) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match event {
+        Event::WindowClosed { id } => notify(*id)?,
+        Event::WindowsChanged { windows } => {
+            for old in state.windows.windows.values() {
+                if !windows.iter().any(|new| new.id == old.id) {
+                    notify(old.id)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn affects_workspace_view(event: &Event) -> bool {
@@ -473,6 +497,102 @@ fn is_open_icon_key(key: &str, window_ids: &HashSet<u64>, app_ids: &HashSet<&str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_window(id: u64) -> niri_ipc::Window {
+        niri_ipc::Window {
+            id,
+            title: None,
+            app_id: None,
+            pid: None,
+            workspace_id: None,
+            is_focused: false,
+            is_floating: false,
+            is_urgent: false,
+            layout: niri_ipc::WindowLayout {
+                pos_in_scrolling_layout: None,
+                tile_size: (0.0, 0.0),
+                window_size: (0, 0),
+                tile_pos_in_workspace_view: None,
+                window_offset_in_tile: (0.0, 0.0),
+            },
+            focus_timestamp: None,
+        }
+    }
+
+    #[test]
+    fn window_closure_direct_event_is_notified() {
+        let state = EventStreamState::default();
+        let event = Event::WindowClosed { id: 42 };
+        let mut notifications = Vec::new();
+
+        notify_window_closures(&state, &event, |id| {
+            notifications.push(NiriEvent::WindowClosed(id));
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(matches!(
+            notifications.as_slice(),
+            [NiriEvent::WindowClosed(42)]
+        ));
+    }
+
+    #[test]
+    fn window_closure_windows_changed_notifies_only_missing_windows() {
+        let mut state = EventStreamState::default();
+        for id in [1, 2, 3] {
+            state.windows.windows.insert(id, sample_window(id));
+        }
+        let event = Event::WindowsChanged {
+            windows: vec![sample_window(2), sample_window(3), sample_window(4)],
+        };
+        let mut notifications = Vec::new();
+
+        notify_window_closures(&state, &event, |id| {
+            notifications.push(NiriEvent::WindowClosed(id));
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(matches!(
+            notifications.as_slice(),
+            [NiriEvent::WindowClosed(1)]
+        ));
+    }
+
+    #[test]
+    fn window_closure_unrelated_events_do_not_notify() {
+        let state = EventStreamState::default();
+        let events = [
+            Event::WorkspaceActivated {
+                id: 1,
+                focused: true,
+            },
+            Event::WorkspaceActiveWindowChanged {
+                workspace_id: 1,
+                active_window_id: Some(2),
+            },
+            Event::WindowFocusChanged { id: Some(2) },
+            Event::WindowUrgencyChanged {
+                id: 2,
+                urgent: true,
+            },
+            Event::WindowLayoutsChanged {
+                changes: Vec::new(),
+            },
+        ];
+        let mut notifications = Vec::new();
+
+        for event in &events {
+            notify_window_closures(&state, event, |id| {
+                notifications.push(NiriEvent::WindowClosed(id));
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        assert!(notifications.is_empty());
+    }
 
     fn sample_icon() -> ApplicationIcon {
         ApplicationIcon {

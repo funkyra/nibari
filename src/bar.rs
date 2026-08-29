@@ -7,9 +7,8 @@ use chrono::{
     format::{Fixed, Item, Numeric, StrftimeItems},
 };
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_shm,
+    compositor::{CompositorHandler, CompositorState, FrameCallbackData},
+    delegate_registry,
     output::{OutputHandler, OutputState},
     reexports::calloop::{
         EventLoop,
@@ -118,8 +117,13 @@ pub fn run(config: Config) -> Result<()> {
     event_loop
         .handle()
         .insert_source(niri_channel, |event, _, app| {
-            if let ChannelEvent::Msg(NiriEvent::State(model)) = event {
-                app.update_niri_model(model);
+            if let ChannelEvent::Msg(event) = event {
+                match event {
+                    NiriEvent::State(model) => app.update_niri_model(model),
+                    NiriEvent::WindowClosed(window_id) => {
+                        app.renderer.evict_task_text(window_id);
+                    }
+                }
             }
         })
         .map_err(|error| anyhow::anyhow!("не удалось подключить niri IPC к event loop: {error}"))?;
@@ -636,7 +640,7 @@ fn draw_surface(
         surface.buffers.push(buffer);
     }
     wayland_surface.damage_buffer(0, 0, width as i32, height as i32);
-    wayland_surface.frame(queue_handle, wayland_surface.clone());
+    wayland_surface.frame(queue_handle, FrameCallbackData(wayland_surface.clone()));
     wayland_surface.commit();
 
     surface.dirty = false;
@@ -709,7 +713,7 @@ fn draw_menu_surface(
     }
 
     wayland_surface.damage_buffer(0, 0, width as i32, height as i32);
-    wayland_surface.frame(queue_handle, wayland_surface.clone());
+    wayland_surface.frame(queue_handle, FrameCallbackData(wayland_surface.clone()));
     wayland_surface.commit();
 
     surface.dirty = false;
@@ -1064,13 +1068,8 @@ impl PointerHandler for App {
     }
 }
 
-delegate_compositor!(App);
-delegate_output!(App);
-delegate_layer!(App);
-delegate_shm!(App);
-delegate_seat!(App);
-delegate_pointer!(App);
 delegate_registry!(App);
+smithay_client_toolkit::delegate_dispatch2!(App);
 delegate_noop!(App: ignore wl_region::WlRegion);
 
 fn clock_granularity(format: &str) -> ClockGranularity {

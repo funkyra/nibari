@@ -4,7 +4,7 @@ use smithay_client_toolkit::reexports::calloop::channel::Sender as UiSender;
 use system_tray::{
     client::{ActivateRequest, Client, Event, UpdateEvent},
     item::{IconPixmap, Status, StatusNotifierItem},
-    menu::{MenuItem, MenuType, TrayMenu},
+    menu::{MenuItem, MenuType, ToggleState, ToggleType, TrayMenu},
 };
 use tiny_skia::Pixmap;
 use tokio::sync::{broadcast::error::RecvError, mpsc};
@@ -115,6 +115,9 @@ pub struct TrayMenuEntry {
     pub label: String,
     pub enabled: bool,
     pub separator: bool,
+    pub submenu: Vec<TrayMenuEntry>,
+    pub toggle_type: ToggleType,
+    pub toggle_state: ToggleState,
 }
 
 struct IconSettings {
@@ -366,11 +369,18 @@ fn menu_entry(item: &MenuItem) -> Option<TrayMenuEntry> {
         clean_menu_label(item.label.as_deref().unwrap_or_default())
     };
 
+    let submenu: Vec<_> = item.submenu.iter().filter_map(menu_entry).collect();
+    let is_submenu =
+        item.children_display.as_deref() == Some("submenu") || !item.submenu.is_empty();
     (separator || !label.is_empty()).then_some(TrayMenuEntry {
         id: item.id,
         label,
-        enabled: item.enabled,
+        // Empty/lazy submenus are not leaf actions and must not emit a click.
+        enabled: item.enabled && (!is_submenu || !submenu.is_empty()),
         separator,
+        submenu,
+        toggle_type: item.toggle_type,
+        toggle_state: item.toggle_state,
     })
 }
 
@@ -609,6 +619,93 @@ fn premultiply(channel: u8, alpha: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dbus_menu_item(id: i32, label: &str) -> MenuItem {
+        MenuItem {
+            id,
+            label: Some(label.to_owned()),
+            enabled: true,
+            visible: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn empty_submenus_cannot_be_activated_as_leaf_actions() {
+        let mut parent = dbus_menu_item(1, "Status");
+        parent.children_display = Some("submenu".into());
+        assert!(!menu_entry(&parent).unwrap().enabled);
+        let mut child = dbus_menu_item(2, "Hidden status");
+        child.visible = false;
+        parent.submenu.push(child);
+        assert!(!menu_entry(&parent).unwrap().enabled);
+        parent.submenu[0].visible = true;
+        assert!(menu_entry(&parent).unwrap().enabled);
+    }
+
+    #[test]
+    fn menu_conversion_preserves_nested_actions() {
+        let mut parent = dbus_menu_item(1, "_Settings");
+        let mut child = dbus_menu_item(2, "_Notifications");
+        let mut disabled = dbus_menu_item(3, "_Quiet mode");
+        disabled.enabled = false;
+        child.submenu.push(disabled);
+        let mut hidden = dbus_menu_item(4, "Hidden");
+        hidden.visible = false;
+        child.submenu.push(hidden);
+        child.submenu.push(dbus_menu_item(5, ""));
+        let mut separator = dbus_menu_item(6, "Ignored separator label");
+        separator.menu_type = MenuType::Separator;
+        child.submenu.push(separator);
+        parent.submenu.push(child);
+        let with_child = menu_entry(&parent);
+
+        parent.submenu.clear();
+        assert_ne!(with_child, menu_entry(&parent));
+
+        let entry = with_child.unwrap();
+        assert_eq!(entry.label, "Settings");
+        assert_eq!(entry.submenu.len(), 1);
+        let child = &entry.submenu[0];
+        assert_eq!((child.id, child.label.as_str()), (2, "Notifications"));
+        assert_eq!(child.submenu.len(), 2);
+        let disabled = &child.submenu[0];
+        assert_eq!((disabled.id, disabled.label.as_str()), (3, "Quiet mode"));
+        assert!(!disabled.enabled);
+        assert!(disabled.submenu.is_empty());
+        assert!(child.submenu[1].separator);
+        assert!(child.submenu[1].label.is_empty());
+    }
+
+    #[test]
+    fn menu_conversion_preserves_toggle_state() {
+        let mut item = dbus_menu_item(1, "_Notifications");
+        item.toggle_type = ToggleType::Checkmark;
+        item.toggle_state = ToggleState::On;
+        let checked = menu_entry(&item);
+
+        item.toggle_state = ToggleState::Off;
+        assert_ne!(checked, menu_entry(&item));
+        assert_eq!(checked.unwrap().toggle_state, ToggleState::On);
+        assert_eq!(menu_entry(&item).unwrap().toggle_state, ToggleState::Off);
+        item.toggle_state = ToggleState::Indeterminate;
+        assert_eq!(
+            menu_entry(&item).unwrap().toggle_state,
+            ToggleState::Indeterminate
+        );
+    }
+
+    #[test]
+    fn menu_conversion_preserves_toggle_type() {
+        let mut item = dbus_menu_item(1, "_Notifications");
+        item.toggle_type = ToggleType::Checkmark;
+        let checkbox = menu_entry(&item);
+
+        item.toggle_type = ToggleType::Radio;
+        assert_ne!(checkbox, menu_entry(&item));
+        assert_eq!(checkbox.unwrap().toggle_type, ToggleType::Checkmark);
+        assert_eq!(menu_entry(&item).unwrap().toggle_type, ToggleType::Radio);
+    }
 
     #[test]
     fn converts_argb_to_premultiplied_rgba() {

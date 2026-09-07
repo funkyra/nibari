@@ -1,12 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, mpsc},
     thread,
     time::Duration,
 };
 
 use niri_ipc::{
-    Event, Request, Response,
+    Action, Event, Request, Response, WorkspaceReferenceArg,
     socket::Socket,
     state::{EventStreamState, EventStreamStatePart},
 };
@@ -35,6 +35,7 @@ struct WorkspaceModel {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WorkspaceInfo {
+    id: u64,
     index: u8,
     output: Option<String>,
     is_active: bool,
@@ -45,6 +46,7 @@ struct WorkspaceInfo {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WorkspaceSlot {
+    pub id: Option<u64>,
     pub index: u8,
     pub is_active: bool,
     pub is_focused: bool,
@@ -113,6 +115,7 @@ impl NiriModel {
             self.workspaces
                 .workspace_for(workspace_index, output, output_group)
                 .map(|workspace| WorkspaceSlot {
+                    id: Some(workspace.id),
                     index: label_index,
                     is_active: workspace.is_active,
                     is_focused: workspace.is_focused,
@@ -149,14 +152,13 @@ impl WorkspaceModel {
         output: Option<&str>,
         output_group: u8,
     ) -> Option<&WorkspaceInfo> {
-        output
-            .and_then(|output| self.workspace_for_output(index, output))
-            .or_else(|| {
-                self.workspaces
-                    .iter()
-                    .filter(|workspace| workspace.index == index)
-                    .nth(output_group.min(1) as usize)
-            })
+        if let Some(output) = output {
+            return self.workspace_for_output(index, output);
+        }
+        self.workspaces
+            .iter()
+            .filter(|workspace| workspace.index == index)
+            .nth(output_group.min(1) as usize)
             .or_else(|| {
                 self.workspaces
                     .iter()
@@ -184,12 +186,78 @@ pub enum NiriEvent {
     WindowClosed(u64),
 }
 
-pub fn spawn(events: UiSender<NiriEvent>, config: &Config) {
+pub enum FocusCommand {
+    Workspace {
+        id: Option<u64>,
+        index: u8,
+        output: Option<String>,
+    },
+    Window(u64),
+}
+
+impl FocusCommand {
+    fn actions(self) -> Vec<Action> {
+        match self {
+            Self::Window(id) => vec![Action::FocusWindow { id }],
+            Self::Workspace { id: Some(id), .. } => vec![Action::FocusWorkspace {
+                reference: WorkspaceReferenceArg::Id(id),
+            }],
+            Self::Workspace { index, output, .. } => output
+                .map(|output| Action::FocusMonitor { output })
+                .into_iter()
+                .chain(std::iter::once(Action::FocusWorkspace {
+                    reference: WorkspaceReferenceArg::Index(index),
+                }))
+                .collect(),
+        }
+    }
+}
+
+pub struct NiriHandle {
+    commands: mpsc::Sender<FocusCommand>,
+}
+
+impl NiriHandle {
+    pub fn focus(&self, command: FocusCommand) {
+        if let Err(error) = self.commands.send(command) {
+            log::warn!("failed to queue niri focus command: {error}");
+        }
+    }
+}
+
+fn execute_focus(socket: &mut Socket, command: FocusCommand) -> anyhow::Result<()> {
+    for action in command.actions() {
+        match socket.send(Request::Action(action))? {
+            Ok(Response::Handled) => {}
+            Ok(response) => anyhow::bail!("unexpected response: {response:?}"),
+            Err(message) => anyhow::bail!("{message}"),
+        }
+    }
+    Ok(())
+}
+
+pub fn spawn(events: UiSender<NiriEvent>, config: &Config) -> NiriHandle {
     let config = config.clone();
     thread::Builder::new()
         .name("nibari-niri".into())
         .spawn(move || listen_forever(events, config))
         .expect("failed to start niri IPC thread");
+
+    let (commands, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("nibari-niri-actions".into())
+        .spawn(move || {
+            for command in receiver {
+                let result = Socket::connect()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|mut socket| execute_focus(&mut socket, command));
+                if let Err(error) = result {
+                    log::warn!("niri focus command failed: {error}");
+                }
+            }
+        })
+        .expect("failed to start niri action thread");
+    NiriHandle { commands }
 }
 
 fn listen_forever(events: UiSender<NiriEvent>, config: Config) {
@@ -324,6 +392,7 @@ fn workspace_model(state: &EventStreamState) -> WorkspaceModel {
         .values()
         .filter(|workspace| (1..=10).contains(&workspace.idx))
         .map(|workspace| WorkspaceInfo {
+            id: workspace.id,
             index: workspace.idx,
             output: workspace.output.clone(),
             is_active: workspace.is_active,
@@ -630,6 +699,7 @@ mod tests {
             workspaces: WorkspaceModel {
                 workspaces: vec![
                     WorkspaceInfo {
+                        id: 101,
                         index: 1,
                         output: Some("DP-1".into()),
                         is_active: true,
@@ -638,6 +708,7 @@ mod tests {
                         is_urgent: false,
                     },
                     WorkspaceInfo {
+                        id: 202,
                         index: 1,
                         output: Some("HDMI-A-1".into()),
                         is_active: true,
@@ -671,10 +742,68 @@ mod tests {
         let hdmi = model.surface_content(Some("HDMI-A-1"), 1);
 
         assert_eq!(dp.workspaces[0].index, 1);
+        assert_eq!(dp.workspaces[0].id, Some(101));
         assert!(dp.workspaces[0].is_focused);
         assert_eq!(dp.tasks[0].label, "Terminal");
         assert_eq!(hdmi.workspaces[0].index, 6);
+        assert_eq!(hdmi.workspaces[0].id, Some(202));
         assert!(hdmi.tasks.is_empty());
+    }
+
+    #[test]
+    fn missing_workspace_does_not_target_another_monitor() {
+        let mut model = two_output_model();
+        model.workspaces.workspaces.pop();
+
+        let slots = model.slots_for(Some("HDMI-A-1"), 1);
+
+        assert_eq!(slots[0].index, 6);
+        assert_eq!(slots[0].id, None);
+        assert!(!slots[0].is_focused);
+        assert!(!slots[0].is_occupied);
+    }
+
+    #[test]
+    fn focus_uses_workspace_id_instead_of_its_label_or_current_monitor() {
+        let slot = two_output_model().slots_for(Some("HDMI-A-1"), 1)[0];
+        let actions = FocusCommand::Workspace {
+            id: slot.id,
+            index: 1,
+            output: Some("HDMI-A-1".into()),
+        }
+        .actions();
+
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::FocusWorkspace {
+                reference: WorkspaceReferenceArg::Id(202)
+            }]
+        ));
+    }
+
+    #[test]
+    fn empty_workspace_focus_selects_its_monitor_before_its_local_index() {
+        let actions = FocusCommand::Workspace {
+            id: None,
+            index: 5,
+            output: Some("HDMI-A-1".into()),
+        }
+        .actions();
+
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::FocusMonitor { output }, Action::FocusWorkspace {
+                reference: WorkspaceReferenceArg::Index(5)
+            }] if output == "HDMI-A-1"
+        ));
+    }
+
+    #[test]
+    fn window_focus_targets_the_exact_window_id() {
+        assert!(matches!(
+            FocusCommand::Window(42).actions().as_slice(),
+            [Action::FocusWindow { id: 42 }]
+        ));
     }
 
     #[test]
@@ -728,6 +857,7 @@ mod tests {
             workspaces: WorkspaceModel {
                 workspaces: vec![
                     WorkspaceInfo {
+                        id: 101,
                         index: 1,
                         output: Some("DP-1".into()),
                         is_active: true,
@@ -736,6 +866,7 @@ mod tests {
                         is_urgent: false,
                     },
                     WorkspaceInfo {
+                        id: 202,
                         index: 1,
                         output: Some("HDMI-A-1".into()),
                         is_active: true,

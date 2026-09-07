@@ -5,10 +5,13 @@ use cosmic_text::{
 };
 use tiny_skia::{Color, Paint, Pixmap, PixmapMut, Rect, Transform};
 
+mod menu;
+pub use menu::{MenuHitbox, MenuSelection, PreparedMenu};
+
 use crate::{
     config::Config,
     niri::{WORKSPACE_LABELS, WORKSPACES_PER_OUTPUT, WindowTask, WorkspaceSlot},
-    tray::{TrayIcon, TrayMenuEntry},
+    tray::TrayIcon,
 };
 
 fn font_path(output: &str) -> Option<PathBuf> {
@@ -107,23 +110,35 @@ fn task_right_edge(
     right_content_left - task_spacing * scale - keyboard_gap
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HitTarget {
+    Workspace { id: Option<u64>, index: u8 },
+    Window(u64),
+    Tray(usize),
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Hitbox {
-    pub tray_index: usize,
+    pub target: HitTarget,
     pub x: i32,
     pub y: i32,
     pub width: i32,
     pub height: i32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MenuHitbox {
-    pub item_id: i32,
-    pub enabled: bool,
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
+pub fn hit_target_at(hitboxes: &[Hitbox], scale: u32, x: f64, y: f64) -> Option<HitTarget> {
+    let x = (x * f64::from(scale.max(1))).floor() as i32;
+    let y = (y * f64::from(scale.max(1))).floor() as i32;
+    hitboxes
+        .iter()
+        .rev()
+        .find(|hitbox| {
+            x >= hitbox.x
+                && x < hitbox.x + hitbox.width
+                && y >= hitbox.y
+                && y < hitbox.y + hitbox.height
+        })
+        .map(|hitbox| hitbox.target)
 }
 
 #[derive(Clone, Copy)]
@@ -217,7 +232,7 @@ impl BarLayout {
 
     fn hitbox(self, tray_index: usize) -> Hitbox {
         Hitbox {
-            tray_index,
+            target: HitTarget::Tray(tray_index),
             x: self.icon_x(tray_index),
             y: self.icon_y,
             width: self.icon_size,
@@ -237,28 +252,6 @@ struct TextBitmap {
     color: [u8; 4],
     reserved_width: u32,
     pixmap: Pixmap,
-}
-
-pub struct PreparedMenu {
-    width: u32,
-    height: u32,
-    row_height: u32,
-    padding: u32,
-    scale: u32,
-    entries: Vec<PreparedMenuEntry>,
-}
-
-struct PreparedMenuEntry {
-    id: i32,
-    enabled: bool,
-    separator: bool,
-    text: Option<Pixmap>,
-}
-
-impl PreparedMenu {
-    pub fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
 }
 
 struct IconBitmap {
@@ -451,9 +444,9 @@ impl Renderer {
 
         let background = self.style.background;
         pixmap.fill(background);
-        self.draw_workspaces(pixmap, scale, workspaces);
-        self.draw_tasks(pixmap, scale, workspaces.len(), tasks, layout);
         hitboxes.clear();
+        self.draw_workspaces(pixmap, scale, workspaces, hitboxes);
+        self.draw_tasks(pixmap, scale, workspaces.len(), tasks, layout, hitboxes);
         let cached_clock = &self.clock_cache[&scale].pixmap;
         draw_premultiplied(
             pixmap,
@@ -495,98 +488,6 @@ impl Renderer {
             );
             hitboxes.push(hitbox);
         }
-    }
-
-    pub fn prepare_menu(&mut self, entries: &[TrayMenuEntry], scale: u32) -> PreparedMenu {
-        let scale = scale.max(1);
-        let padding = self.style.task_padding.saturating_mul(scale);
-        let row_height = self.menu_row_height(scale);
-        let entries: Vec<_> = entries
-            .iter()
-            .map(|entry| {
-                let text = (!entry.separator).then(|| {
-                    self.rasterize_text(
-                        &entry.label,
-                        scale,
-                        if entry.enabled {
-                            self.style.foreground
-                        } else {
-                            self.style.workspace_empty_foreground
-                        },
-                    )
-                });
-                PreparedMenuEntry {
-                    id: entry.id,
-                    enabled: entry.enabled,
-                    separator: entry.separator,
-                    text,
-                }
-            })
-            .collect();
-        let text_width = entries
-            .iter()
-            .filter_map(|entry| entry.text.as_ref().map(Pixmap::width))
-            .max()
-            .unwrap_or(1);
-
-        PreparedMenu {
-            width: text_width.saturating_add(padding * 2).max(120 * scale),
-            height: row_height.saturating_mul(entries.len().max(1) as u32),
-            row_height,
-            padding,
-            scale,
-            entries,
-        }
-    }
-
-    pub fn draw_menu(
-        &mut self,
-        pixmap: &mut PixmapMut<'_>,
-        menu: &PreparedMenu,
-        hitboxes: &mut Vec<MenuHitbox>,
-    ) {
-        let row_height = menu.row_height as i32;
-        let padding = menu.padding as i32;
-        pixmap.fill(self.style.background);
-        hitboxes.clear();
-        hitboxes.reserve(menu.entries.len());
-
-        menu.entries.iter().enumerate().for_each(|(index, entry)| {
-            let y = index as i32 * row_height;
-            if entry.separator {
-                fill_rect(
-                    pixmap,
-                    padding,
-                    y + row_height / 2,
-                    pixmap.width() as i32 - padding * 2,
-                    menu.scale as i32,
-                    self.style.workspace_active_background,
-                );
-                return;
-            }
-
-            let text = entry.text.as_ref().expect("text prepared for menu entry");
-            draw_premultiplied(
-                pixmap,
-                padding,
-                y + (row_height - text.height() as i32) / 2,
-                text.width(),
-                text.height(),
-                text.data(),
-            );
-            hitboxes.push(MenuHitbox {
-                item_id: entry.id,
-                enabled: entry.enabled,
-                x: 0,
-                y,
-                width: pixmap.width() as i32,
-                height: row_height,
-            });
-        });
-    }
-
-    fn menu_row_height(&self, scale: u32) -> u32 {
-        ((self.style.font_size * scale as f32 * 1.8).ceil() as u32).max(20 * scale)
     }
 
     fn cache_keyboard_layout(&mut self, text: &str, scale: u32) {
@@ -637,7 +538,17 @@ impl Renderer {
     }
 
     fn rasterize_text(&mut self, text: &str, scale: u32, color: [u8; 4]) -> Pixmap {
-        let font_size = self.style.font_size * scale as f32;
+        self.rasterize_text_with_size(text, scale, color, self.style.font_size)
+    }
+
+    fn rasterize_text_with_size(
+        &mut self,
+        text: &str,
+        scale: u32,
+        color: [u8; 4],
+        font_size: f32,
+    ) -> Pixmap {
+        let font_size = font_size * scale as f32;
         let line_height = (font_size * 1.25).ceil();
         let metrics = Metrics::new(font_size, line_height);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
@@ -674,12 +585,23 @@ impl Renderer {
         pixmap: &mut PixmapMut<'_>,
         scale: u32,
         workspaces: &[WorkspaceSlot],
+        hitboxes: &mut Vec<Hitbox>,
     ) {
         let width = (self.style.workspace_width * scale) as i32;
         let height = pixmap.height() as i32;
 
         for (offset, workspace) in workspaces.iter().enumerate() {
             let x = offset as i32 * width;
+            hitboxes.push(Hitbox {
+                target: HitTarget::Workspace {
+                    id: workspace.id,
+                    index: offset as u8 + 1,
+                },
+                x,
+                y: 0,
+                width: width.min(pixmap.width() as i32 - x).max(0),
+                height,
+            });
             if let Some(background) = workspace_background(&self.style, *workspace) {
                 fill_rect(pixmap, x, 0, width, height, background);
             }
@@ -743,6 +665,7 @@ impl Renderer {
         workspace_count: usize,
         tasks: &[WindowTask],
         bar: BarLayout,
+        hitboxes: &mut Vec<Hitbox>,
     ) {
         let scale_i32 = scale as i32;
         let left = self.style.workspace_width as i32 * workspace_count as i32 * scale_i32;
@@ -773,6 +696,13 @@ impl Renderer {
             let Some(rect) = layout.item(index) else {
                 return;
             };
+            hitboxes.push(Hitbox {
+                target: HitTarget::Window(task.id),
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            });
             fill_rect(
                 pixmap,
                 rect.x,
@@ -1124,7 +1054,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::niri::ApplicationIcon;
+    use crate::{niri::ApplicationIcon, tray::TrayMenuEntry};
 
     fn menu_entry(id: i32, label: &str, enabled: bool) -> TrayMenuEntry {
         TrayMenuEntry {
@@ -1132,6 +1062,9 @@ mod tests {
             label: label.into(),
             enabled,
             separator: false,
+            submenu: Vec::new(),
+            toggle_type: Default::default(),
+            toggle_state: Default::default(),
         }
     }
 
@@ -1141,6 +1074,9 @@ mod tests {
             label: String::new(),
             enabled: false,
             separator: true,
+            submenu: Vec::new(),
+            toggle_type: Default::default(),
+            toggle_state: Default::default(),
         }
     }
 
@@ -1176,6 +1112,40 @@ mod tests {
     }
 
     #[test]
+    fn menu_surface_has_transparent_outer_corners() {
+        let mut renderer = Renderer::new(&Config::default());
+        let menu = renderer.prepare_menu(&[menu_entry(1, "Open", true)], 1, None);
+        let (width, height) = menu.size();
+        let mut pixmap = Pixmap::new(width, height).unwrap();
+        renderer.draw_menu(&mut pixmap.as_mut(), &menu, &mut Vec::new(), None);
+        assert_eq!(pixmap.pixel(0, 0).unwrap().alpha(), 0);
+        assert_eq!(pixmap.pixel(width / 2, height / 2).unwrap().alpha(), 255);
+    }
+
+    #[test]
+    fn menu_separators_are_compact_and_outer_separators_removed() {
+        let mut renderer = Renderer::new(&Config::default());
+        let plain = renderer.prepare_menu(
+            &[menu_entry(1, "Open", true), menu_entry(2, "Quit", true)],
+            1,
+            None,
+        );
+        let grouped = renderer.prepare_menu(
+            &[
+                separator(),
+                menu_entry(1, "Open", true),
+                separator(),
+                separator(),
+                menu_entry(2, "Quit", true),
+                separator(),
+            ],
+            1,
+            None,
+        );
+        assert_eq!(grouped.size().1 - plain.size().1, 9);
+    }
+
+    #[test]
     fn prepared_menu_supplies_size_and_enabled_hitboxes() {
         let mut renderer = Renderer::new(&Config::default());
         let entries = [
@@ -1183,15 +1153,15 @@ mod tests {
             separator(),
             menu_entry(2, "Quit", false),
         ];
-        let menu = renderer.prepare_menu(&entries, 1);
+        let menu = renderer.prepare_menu(&entries, 1, None);
         let (width, height) = menu.size();
         let mut pixmap = Pixmap::new(width, height).unwrap();
         let mut hitboxes = Vec::new();
 
-        renderer.draw_menu(&mut pixmap.as_mut(), &menu, &mut hitboxes);
+        renderer.draw_menu(&mut pixmap.as_mut(), &menu, &mut hitboxes, None);
 
         assert_eq!(hitboxes.len(), 2);
-        assert_eq!(hitboxes[0].item_id, 1);
+        assert_eq!(hitboxes[0].selection, MenuSelection::Item(1));
         assert!(!hitboxes[1].enabled);
     }
 
@@ -1372,6 +1342,8 @@ mod tests {
             &pixmap.data()[task_start..task_start + 4],
             &[0x12, 0x34, 0x56, 255]
         );
+        assert_eq!(hitboxes.len(), WORKSPACES_PER_OUTPUT + tasks.len());
+        assert_eq!(hitboxes[WORKSPACES_PER_OUTPUT].x, task_start as i32 / 4);
     }
 
     #[test]
@@ -1435,6 +1407,101 @@ mod tests {
                 .chunks_exact(4)
                 .any(|pixel| pixel == [255, 0, 0, 255])
         );
-        assert_eq!(hitboxes.len(), 1);
+        assert_eq!(
+            hitboxes.len(),
+            WORKSPACES_PER_OUTPUT + tasks.len() + tray.len()
+        );
+        assert_eq!(hitboxes.last().unwrap().target, HitTarget::Tray(0));
+    }
+
+    #[test]
+    fn rendered_buttons_hit_the_correct_targets_at_each_scale() {
+        let config = Config::default();
+        let mut renderer = Renderer::new(&config);
+        let workspaces = std::array::from_fn(|offset| WorkspaceSlot {
+            id: Some(100 + offset as u64),
+            index: offset as u8 + 6,
+            ..WorkspaceSlot::default()
+        });
+        let tasks = [42, 99].map(|id| WindowTask {
+            id,
+            label: "Terminal".into(),
+            app_id: None,
+            is_focused: false,
+            is_urgent: false,
+            icon: ApplicationIcon {
+                revision: 1,
+                pixels: Arc::from([0, 0, 255, 255]),
+                width: 1,
+                height: 1,
+            },
+        });
+        let mut hitboxes = Vec::new();
+
+        for scale in [1, 2, 3] {
+            let mut pixmap = Pixmap::new(800 * scale, config.height * scale).unwrap();
+            let content = RenderContent {
+                scale,
+                clock: "12:34",
+                keyboard_layout: "RU",
+                tray: &[],
+                workspaces: &workspaces,
+                tasks: &tasks,
+            };
+            renderer.draw(&mut pixmap.as_mut(), content, &mut hitboxes);
+
+            for (offset, workspace) in workspaces.iter().enumerate() {
+                let x = f64::from(config.workspace_width) * (offset as f64 + 0.5);
+                assert_eq!(
+                    hit_target_at(&hitboxes, scale, x, 0.5),
+                    Some(HitTarget::Workspace {
+                        id: workspace.id,
+                        index: offset as u8 + 1
+                    })
+                );
+            }
+            for hitbox in &hitboxes[WORKSPACES_PER_OUTPUT..] {
+                for physical_x in [hitbox.x, hitbox.x + hitbox.width - 1] {
+                    let x = (f64::from(physical_x) + 0.5) / f64::from(scale);
+                    assert_eq!(hit_target_at(&hitboxes, scale, x, 0.5), Some(hitbox.target));
+                }
+            }
+            assert_eq!(
+                hitboxes[WORKSPACES_PER_OUTPUT].target,
+                HitTarget::Window(42)
+            );
+            assert_eq!(
+                hitboxes[WORKSPACES_PER_OUTPUT + 1].target,
+                HitTarget::Window(99)
+            );
+            let first = hitboxes[WORKSPACES_PER_OUTPUT];
+            let gap_x = f64::from(first.x + first.width) / f64::from(scale);
+            assert_eq!(hit_target_at(&hitboxes, scale, gap_x, 0.5), None);
+            assert_eq!(hit_target_at(&hitboxes, scale, -0.1, 0.5), None);
+            assert_eq!(
+                hit_target_at(&hitboxes, scale, 0.5, f64::from(config.height)),
+                None
+            );
+
+            renderer.draw(
+                &mut pixmap.as_mut(),
+                RenderContent {
+                    tasks: &[],
+                    ..content
+                },
+                &mut hitboxes,
+            );
+            assert_eq!(hitboxes.len(), WORKSPACES_PER_OUTPUT);
+            assert_eq!(hit_target_at(&hitboxes, scale, gap_x - 1.0, 0.5), None);
+
+            let mut narrow =
+                Pixmap::new(config.workspace_width * scale, config.height * scale).unwrap();
+            renderer.draw(&mut narrow.as_mut(), content, &mut hitboxes);
+            assert!(
+                hitboxes
+                    .iter()
+                    .all(|hitbox| !matches!(hitbox.target, HitTarget::Window(_)))
+            );
+        }
     }
 }

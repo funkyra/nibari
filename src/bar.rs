@@ -6,6 +6,7 @@ use chrono::{
     Local, Timelike,
     format::{Fixed, Item, Numeric, StrftimeItems},
 };
+use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
     delegate_registry,
@@ -19,12 +20,20 @@ use smithay_client_toolkit::{
     registry_handlers,
     seat::{
         Capability, SeatHandler, SeatState,
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
         pointer::{PointerEvent, PointerEventKind, PointerHandler},
     },
     shell::{
         WaylandSurface,
         wlr_layer::{
-            Anchor, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
+            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
+            LayerSurfaceConfigure,
+        },
+        xdg::{
+            XdgPositioner, XdgShell,
+            dialog::{Dialog, DialogHandler},
+            popup::{Popup, PopupConfigure, PopupHandler},
+            window::{Window, WindowConfigure, WindowHandler},
         },
     },
     shm::{
@@ -36,18 +45,24 @@ use tiny_skia::PixmapMut;
 use wayland_client::{
     Connection, QueueHandle, delegate_noop,
     globals::registry_queue_init,
-    protocol::{wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_surface},
 };
 
 use crate::{
     config::Config,
     niri::{
-        self, NiriEvent, NiriModel, SurfaceContent, WORKSPACES_PER_OUTPUT, WindowTask,
-        WorkspaceSlot,
+        self, FocusCommand, NiriEvent, NiriHandle, NiriModel, SurfaceContent,
+        WORKSPACES_PER_OUTPUT, WindowTask, WorkspaceSlot,
     },
-    render::{Hitbox, MenuHitbox, PreparedMenu, RenderContent, Renderer},
+    render::{
+        HitTarget, Hitbox, MenuHitbox, MenuSelection, PreparedMenu, RenderContent, Renderer,
+        hit_target_at,
+    },
     tray::{TrayEvent, TrayHandle, TrayIcon, TrayMenuEntry, TrayMenuPopup},
 };
+
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
 
 pub fn run(config: Config) -> Result<()> {
     let connection = Connection::connect_to_env().context("не удалось подключиться к Wayland")?;
@@ -59,6 +74,8 @@ pub fn run(config: Config) -> Result<()> {
         .context("compositor не предоставляет wl_compositor")?;
     let layer_shell = LayerShell::bind(&globals, &queue_handle)
         .context("compositor не предоставляет wlr-layer-shell")?;
+    let xdg_shell =
+        XdgShell::bind(&globals, &queue_handle).context("compositor does not provide xdg-shell")?;
     let shm =
         Shm::bind(&globals, &queue_handle).context("compositor не предоставляет shared memory")?;
 
@@ -71,7 +88,7 @@ pub fn run(config: Config) -> Result<()> {
     let (tray_events, tray_channel) = channel::channel();
     let tray = TrayHandle::spawn(tray_events, &config);
     let (niri_events, niri_channel) = channel::channel();
-    niri::spawn(niri_events, &config);
+    let niri = niri::spawn(niri_events, &config);
     let clock_granularity = clock_granularity(&config.clock_format);
     let renderer = Renderer::new(&config);
     let background_opaque = config.background_rgba()[3] == 255;
@@ -82,6 +99,7 @@ pub fn run(config: Config) -> Result<()> {
         seat_state: SeatState::new(&globals, &queue_handle),
         compositor,
         layer_shell,
+        xdg_shell,
         shm,
         queue_handle,
         config,
@@ -90,10 +108,13 @@ pub fn run(config: Config) -> Result<()> {
         surfaces: Vec::new(),
         menu_surface: None,
         pointers: Vec::new(),
+        keyboards: Vec::new(),
+        pending_menu_grab: None,
         clock: String::new(),
         clock_granularity,
         tray_icons: Vec::new(),
         niri_model: Arc::new(NiriModel::default()),
+        niri,
         tray,
     };
     app.update_clock();
@@ -150,6 +171,7 @@ struct BarSurface {
     output: wl_output::WlOutput,
     output_name: Option<String>,
     output_position: (i32, i32),
+    output_size: (u32, u32),
     workspace_group: u8,
     content: SurfaceContent,
     logical_width: u32,
@@ -164,12 +186,20 @@ struct BarSurface {
 }
 
 struct MenuSurface {
-    layer: LayerSurface,
+    popup: Popup,
+    parent: LayerSurface,
     pool: SlotPool,
     address: String,
     menu_path: String,
     entries: Vec<TrayMenuEntry>,
+    pages: Vec<MenuPage>,
+    title: Option<String>,
     prepared: PreparedMenu,
+    selected: Option<MenuSelection>,
+    anchor_x: i32,
+    output_width: u32,
+    output_height: u32,
+    reposition_token: u32,
     logical_width: u32,
     logical_height: u32,
     scale: u32,
@@ -181,12 +211,26 @@ struct MenuSurface {
     format: wl_shm::Format,
 }
 
+impl Drop for MenuSurface {
+    fn drop(&mut self) {
+        self.parent
+            .set_keyboard_interactivity(KeyboardInteractivity::None);
+        self.parent.commit();
+    }
+}
+
+struct MenuPage {
+    title: Option<String>,
+    entries: Vec<TrayMenuEntry>,
+}
+
 struct App {
     registry_state: RegistryState,
     output_state: OutputState,
     seat_state: SeatState,
     compositor: CompositorState,
     layer_shell: LayerShell,
+    xdg_shell: XdgShell,
     shm: Shm,
     queue_handle: QueueHandle<Self>,
     config: Config,
@@ -195,10 +239,13 @@ struct App {
     surfaces: Vec<BarSurface>,
     menu_surface: Option<MenuSurface>,
     pointers: Vec<(wl_seat::WlSeat, wl_pointer::WlPointer)>,
+    keyboards: Vec<(wl_seat::WlSeat, wl_keyboard::WlKeyboard)>,
+    pending_menu_grab: Option<(wl_seat::WlSeat, u32, i32, i32)>,
     clock: String,
     clock_granularity: ClockGranularity,
     tray_icons: Vec<TrayIcon>,
     niri_model: Arc<NiriModel>,
+    niri: NiriHandle,
     tray: TrayHandle,
 }
 
@@ -244,6 +291,11 @@ impl App {
             .and_then(|info| info.logical_position)
             .unwrap_or_default();
         let output_name = info.as_ref().and_then(|info| info.name.clone());
+        let output_size = info
+            .as_ref()
+            .and_then(|info| info.logical_size)
+            .map(|(width, height)| (width.max(0) as u32, height.max(0) as u32))
+            .unwrap_or_default();
         let content = self.niri_model.surface_content(output_name.as_deref(), 0);
 
         let surface = self.compositor.create_surface(&self.queue_handle);
@@ -278,6 +330,7 @@ impl App {
             output,
             output_name,
             output_position,
+            output_size,
             workspace_group: 0,
             content,
             logical_width: 0,
@@ -304,6 +357,10 @@ impl App {
             .filter(|surface| &surface.output == output)
             .for_each(|surface| {
                 surface.output_position = info.logical_position.unwrap_or_default();
+                surface.output_size = info
+                    .logical_size
+                    .map(|(width, height)| (width.max(0) as u32, height.max(0) as u32))
+                    .unwrap_or_default();
                 let output_changed = surface.output_name != info.name;
                 surface.output_name.clone_from(&info.name);
                 if output_changed {
@@ -411,32 +468,61 @@ impl App {
         let Some(target) = self.menu_target(menu.x, menu.y) else {
             return;
         };
-        let prepared = self.renderer.prepare_menu(&menu.items, target.scale);
+        let Some((_, _, grab_x, grab_y)) = self.pending_menu_grab.as_ref() else {
+            log::warn!("ignoring tray menu without a matching pointer grab");
+            return;
+        };
+        if (*grab_x, *grab_y) != (menu.x, menu.y) {
+            log::warn!("ignoring tray menu with a stale pointer grab");
+            return;
+        }
+        let (seat, serial, _, _) = self
+            .pending_menu_grab
+            .take()
+            .expect("validated tray menu grab remains available");
+        let mut prepared = self.renderer.prepare_menu(&menu.items, target.scale, None);
+        constrain_menu(
+            &mut prepared,
+            target.scale,
+            target.logical_width,
+            target.logical_height.saturating_sub(self.config.height),
+        );
         let (buffer_width, buffer_height) = prepared.size();
-        let logical_width = buffer_width.div_ceil(target.scale).max(1);
-        let logical_height = buffer_height.div_ceil(target.scale).max(1);
+        let logical_width =
+            bounded_dimension(buffer_width.div_ceil(target.scale), target.logical_width);
+        let logical_height =
+            bounded_dimension(buffer_height.div_ceil(target.scale), target.logical_height);
         let left = target
             .local_x
             .max(0)
             .min(target.logical_width.saturating_sub(logical_width) as i32);
-        let top = self.config.height as i32;
+        let top = menu_top(self.config.height, logical_height, target.logical_height);
 
         self.menu_surface = None;
 
+        let positioner =
+            match menu_positioner(&self.xdg_shell, left, top, logical_width, logical_height) {
+                Ok(positioner) => positioner,
+                Err(error) => {
+                    log::error!("failed to create tray menu positioner: {error}");
+                    return;
+                }
+            };
         let surface = self.compositor.create_surface(&self.queue_handle);
-        let layer = self.layer_shell.create_layer_surface(
+        let popup = match Popup::from_surface(
+            None,
+            &positioner,
             &self.queue_handle,
             surface,
-            Layer::Overlay,
-            Some("nibari-menu"),
-            Some(&target.output),
-        );
-        layer.set_anchor(Anchor::TOP | Anchor::LEFT);
-        layer.set_margin(top, 0, 0, left);
-        layer.set_size(logical_width, logical_height);
-        layer.set_exclusive_zone(0);
-        let _ = layer.set_buffer_scale(target.scale);
-        layer.commit();
+            &self.xdg_shell,
+        ) {
+            Ok(popup) => popup,
+            Err(error) => {
+                log::error!("failed to create tray menu popup: {error}");
+                return;
+            }
+        };
+        target.parent.get_popup(popup.xdg_popup());
 
         let pool = match SlotPool::new(1, &self.shm) {
             Ok(pool) => pool,
@@ -446,13 +532,31 @@ impl App {
             }
         };
 
+        // Niri grants keyboard grabs only to popups whose parent accepts focus.
+        // Restore the panel's normal non-interactive state when this menu drops.
+        target
+            .parent
+            .set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+        target.parent.commit();
+        popup.xdg_popup().grab(&seat, serial);
+        popup.wl_surface().set_buffer_scale(target.scale as i32);
+        popup.wl_surface().commit();
+
         self.menu_surface = Some(MenuSurface {
-            layer,
+            popup,
+            parent: target.parent,
             pool,
             address: menu.address,
             menu_path: menu.menu_path,
             entries: menu.items,
+            pages: Vec::new(),
+            title: None,
             prepared,
+            selected: None,
+            anchor_x: target.local_x,
+            output_width: target.logical_width,
+            output_height: target.logical_height,
+            reposition_token: 1,
             logical_width,
             logical_height,
             scale: target.scale,
@@ -477,9 +581,10 @@ impl App {
                     && local_x < surface.logical_width as i32
                     && local_y < surface.logical_height as i32)
                     .then(|| MenuTarget {
-                        output: surface.output.clone(),
+                        parent: surface.layer.clone(),
                         scale: surface.scale,
                         logical_width: surface.logical_width,
+                        logical_height: surface.output_size.1,
                         local_x,
                     })
             })
@@ -489,37 +594,175 @@ impl App {
                     .filter(|surface| surface.configured)
                     .min_by_key(|surface| (surface.output_position.0 - x).abs())
                     .map(|surface| MenuTarget {
-                        output: surface.output.clone(),
+                        parent: surface.layer.clone(),
                         scale: surface.scale,
                         logical_width: surface.logical_width,
+                        logical_height: surface.output_size.1,
                         local_x: x - surface.output_position.0,
                     })
             })
+    }
+
+    fn update_menu_page(&mut self) {
+        let Some(menu) = self.menu_surface.as_mut() else {
+            return;
+        };
+        menu.prepared =
+            self.renderer
+                .prepare_menu(&menu.entries, menu.scale, menu.title.as_deref());
+        constrain_menu(
+            &mut menu.prepared,
+            menu.scale,
+            menu.output_width,
+            menu.output_height.saturating_sub(self.config.height),
+        );
+        let (buffer_width, buffer_height) = menu.prepared.size();
+        let logical_width = bounded_dimension(buffer_width.div_ceil(menu.scale), menu.output_width);
+        let logical_height =
+            bounded_dimension(buffer_height.div_ceil(menu.scale), menu.output_height);
+        let left = menu
+            .anchor_x
+            .max(0)
+            .min(menu.output_width.saturating_sub(logical_width) as i32);
+        let top = menu_top(self.config.height, logical_height, menu.output_height);
+
+        menu.logical_width = logical_width;
+        menu.logical_height = logical_height;
+        menu.selected = None;
+        menu.hitboxes.clear();
+        menu.buffers.clear();
+        menu.dirty = true;
+        match menu_positioner(&self.xdg_shell, left, top, logical_width, logical_height) {
+            Ok(positioner) => {
+                menu.popup.reposition(&positioner, menu.reposition_token);
+                menu.reposition_token = menu.reposition_token.wrapping_add(1).max(1);
+            }
+            Err(error) => log::warn!("failed to reposition tray menu: {error}"),
+        }
+    }
+
+    fn go_back_menu(&mut self) {
+        let Some(menu) = self.menu_surface.as_mut() else {
+            return;
+        };
+        let Some(page) = menu.pages.pop() else {
+            self.menu_surface = None;
+            return;
+        };
+        menu.title = page.title;
+        menu.entries = page.entries;
+        self.update_menu_page();
+    }
+
+    fn open_submenu(&mut self, item_id: i32) {
+        let Some(menu) = self.menu_surface.as_mut() else {
+            return;
+        };
+        let Some(entry) = menu
+            .entries
+            .iter()
+            .find(|entry| entry.id == item_id && entry.enabled && !entry.submenu.is_empty())
+            .cloned()
+        else {
+            return;
+        };
+        menu.pages.push(MenuPage {
+            title: menu.title.take(),
+            entries: std::mem::take(&mut menu.entries),
+        });
+        menu.title = Some(entry.label);
+        menu.entries = entry.submenu;
+        self.update_menu_page();
+    }
+
+    fn apply_menu_action(&mut self, action: MenuInputAction) {
+        match action {
+            MenuInputAction::None => {}
+            MenuInputAction::Dismiss => self.menu_surface = None,
+            MenuInputAction::Back => self.go_back_menu(),
+            MenuInputAction::OpenSubmenu(item_id) => self.open_submenu(item_id),
+            MenuInputAction::Activate(item_id) => {
+                let command = self
+                    .menu_surface
+                    .as_ref()
+                    .map(|menu| (menu.address.clone(), menu.menu_path.clone(), item_id));
+                self.menu_surface = None;
+                if let Some((address, menu_path, item_id)) = command {
+                    self.tray.menu_item(address, menu_path, item_id);
+                }
+            }
+        }
+    }
+
+    fn handle_menu_key(&mut self, keysym: Keysym) {
+        let Some(menu) = self.menu_surface.as_mut() else {
+            return;
+        };
+        match keysym {
+            Keysym::Up | Keysym::Down => {
+                let selected = menu
+                    .prepared
+                    .next_selection(menu.selected, keysym == Keysym::Up);
+                if menu.selected != selected {
+                    menu.selected = selected;
+                    menu.dirty = true;
+                }
+                if let Some(selected) = selected
+                    && menu.prepared.ensure_visible(selected)
+                {
+                    menu.dirty = true;
+                }
+            }
+            Keysym::Escape => self.menu_surface = None,
+            Keysym::Left if !menu.pages.is_empty() => self.go_back_menu(),
+            Keysym::Right => {
+                let item_id = match menu.selected {
+                    Some(MenuSelection::Item(item_id)) => item_id,
+                    _ => return,
+                };
+                if menu
+                    .entries
+                    .iter()
+                    .any(|entry| entry.id == item_id && !entry.submenu.is_empty())
+                {
+                    self.open_submenu(item_id);
+                }
+            }
+            Keysym::Return | Keysym::KP_Enter => {
+                let selection = menu.selected;
+                let has_submenu = selection.is_some_and(|selection| match selection {
+                    MenuSelection::Item(item_id) => menu
+                        .entries
+                        .iter()
+                        .any(|entry| entry.id == item_id && !entry.submenu.is_empty()),
+                    MenuSelection::Back => false,
+                });
+                let action =
+                    menu_input_action(BTN_LEFT, selection, has_submenu, !menu.pages.is_empty());
+                self.apply_menu_action(action);
+            }
+            _ => {}
+        }
     }
 
     fn handle_click(&mut self, surface: &wl_surface::WlSurface, button: u32, x: f64, y: f64) {
         if let Some(menu) = self
             .menu_surface
             .as_ref()
-            .filter(|menu| menu.layer.wl_surface() == surface)
+            .filter(|menu| menu.popup.wl_surface() == surface)
         {
             let physical_x = (x * menu.scale as f64).floor() as i32;
             let physical_y = (y * menu.scale as f64).floor() as i32;
-            let command = menu
-                .hitboxes
-                .iter()
-                .find(|hitbox| {
-                    hitbox.enabled
-                        && physical_x >= hitbox.x
-                        && physical_x < hitbox.x + hitbox.width
-                        && physical_y >= hitbox.y
-                        && physical_y < hitbox.y + hitbox.height
-                })
-                .map(|hitbox| (menu.address.clone(), menu.menu_path.clone(), hitbox.item_id));
-            self.menu_surface = None;
-            if let Some((address, menu_path, item_id)) = command {
-                self.tray.menu_item(address, menu_path, item_id);
-            }
+            let selection = menu.prepared.selection_at(physical_x, physical_y);
+            let has_submenu = selection.is_some_and(|selection| match selection {
+                MenuSelection::Item(item_id) => menu
+                    .entries
+                    .iter()
+                    .any(|entry| entry.id == item_id && !entry.submenu.is_empty()),
+                MenuSelection::Back => false,
+            });
+            let action = menu_input_action(button, selection, has_submenu, !menu.pages.is_empty());
+            self.apply_menu_action(action);
             return;
         }
 
@@ -532,34 +775,110 @@ impl App {
             return;
         };
 
-        let physical_x = (x * bar.scale as f64).floor() as i32;
-        let physical_y = (y * bar.scale as f64).floor() as i32;
-        let Some(hitbox) = bar.hitboxes.iter().find(|hitbox| {
-            physical_x >= hitbox.x
-                && physical_x < hitbox.x + hitbox.width
-                && physical_y >= hitbox.y
-                && physical_y < hitbox.y + hitbox.height
-        }) else {
-            self.menu_surface = None;
-            return;
-        };
-        let Some(icon) = self.tray_icons.get(hitbox.tray_index) else {
-            self.menu_surface = None;
-            return;
-        };
-
-        let global_x = bar.output_position.0 + x.round() as i32;
-        let global_y = bar.output_position.1 + y.round() as i32;
         self.menu_surface = None;
-        self.tray.click(icon.id.clone(), button, global_x, global_y);
+        match hit_target_at(&bar.hitboxes, bar.scale, x, y) {
+            Some(HitTarget::Workspace { id, index }) if button == BTN_LEFT => {
+                self.niri.focus(FocusCommand::Workspace {
+                    id,
+                    index,
+                    output: bar.output_name.clone(),
+                });
+            }
+            Some(HitTarget::Window(id)) if button == BTN_LEFT => {
+                self.niri.focus(FocusCommand::Window(id));
+            }
+            Some(HitTarget::Tray(index)) => {
+                if let Some(icon) = self.tray_icons.get(index) {
+                    let global_x = bar.output_position.0 + x.round() as i32;
+                    let global_y = bar.output_position.1 + y.round() as i32;
+                    self.tray.click(icon.id.clone(), button, global_x, global_y);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
 struct MenuTarget {
-    output: wl_output::WlOutput,
+    parent: LayerSurface,
     scale: u32,
     logical_width: u32,
+    logical_height: u32,
     local_x: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuInputAction {
+    None,
+    Dismiss,
+    Back,
+    OpenSubmenu(i32),
+    Activate(i32),
+}
+
+fn menu_input_action(
+    button: u32,
+    selection: Option<MenuSelection>,
+    has_submenu: bool,
+    can_go_back: bool,
+) -> MenuInputAction {
+    match button {
+        BTN_RIGHT if can_go_back => MenuInputAction::Back,
+        BTN_RIGHT => MenuInputAction::Dismiss,
+        BTN_LEFT => match selection {
+            Some(MenuSelection::Back) => MenuInputAction::Back,
+            Some(MenuSelection::Item(id)) if has_submenu => MenuInputAction::OpenSubmenu(id),
+            Some(MenuSelection::Item(id)) => MenuInputAction::Activate(id),
+            None => MenuInputAction::None,
+        },
+        _ => MenuInputAction::None,
+    }
+}
+
+fn bounded_dimension(preferred: u32, output_bound: u32) -> u32 {
+    if output_bound == 0 {
+        preferred.max(1)
+    } else {
+        preferred.clamp(1, output_bound)
+    }
+}
+
+fn constrain_menu(menu: &mut PreparedMenu, scale: u32, logical_width: u32, logical_height: u32) {
+    if logical_width > 0 && logical_height > 0 {
+        menu.constrain(
+            logical_width.saturating_mul(scale),
+            logical_height.saturating_mul(scale),
+        );
+    }
+}
+
+fn menu_top(panel_height: u32, menu_height: u32, output_height: u32) -> i32 {
+    if output_height == 0 {
+        panel_height as i32
+    } else {
+        panel_height.min(output_height.saturating_sub(menu_height)) as i32
+    }
+}
+
+fn menu_positioner(
+    xdg_shell: &XdgShell,
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+) -> Result<XdgPositioner> {
+    let positioner = XdgPositioner::new(xdg_shell)?;
+    positioner.set_size(width as i32, height as i32);
+    positioner.set_anchor_rect(left, top, 1, 1);
+    positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
+    positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
+    positioner.set_constraint_adjustment(
+        xdg_positioner::ConstraintAdjustment::FlipX
+            | xdg_positioner::ConstraintAdjustment::SlideX
+            | xdg_positioner::ConstraintAdjustment::FlipY
+            | xdg_positioner::ConstraintAdjustment::SlideY,
+    );
+    Ok(positioner)
 }
 
 fn workspace_groups(outputs: impl IntoIterator<Item = ((i32, i32), Option<String>)>) -> Vec<u8> {
@@ -666,7 +985,7 @@ fn draw_menu_surface(
     }
 
     let stride = width.checked_mul(4).context("переполнение menu stride")?;
-    let wayland_surface = surface.layer.wl_surface();
+    let wayland_surface = surface.popup.wl_surface();
     let frame = MenuFrame {
         width,
         height,
@@ -683,6 +1002,7 @@ fn draw_menu_surface(
                 renderer,
                 &mut surface.hitboxes,
                 &surface.prepared,
+                surface.selected,
                 frame,
             )?;
             reusable = Some(index);
@@ -704,6 +1024,7 @@ fn draw_menu_surface(
             renderer,
             &mut surface.hitboxes,
             &surface.prepared,
+            surface.selected,
             frame,
         )?;
         buffer
@@ -751,11 +1072,12 @@ fn render_menu_canvas(
     renderer: &mut Renderer,
     hitboxes: &mut Vec<MenuHitbox>,
     menu: &PreparedMenu,
+    selected: Option<MenuSelection>,
     frame: MenuFrame,
 ) -> Result<()> {
     let mut pixmap = PixmapMut::from_bytes(canvas, frame.width, frame.height)
         .context("некорректный размер menu pixmap")?;
-    renderer.draw_menu(&mut pixmap, menu, hitboxes);
+    renderer.draw_menu(&mut pixmap, menu, hitboxes, selected);
     convert_canvas_for_wayland(&mut pixmap, frame.format);
     Ok(())
 }
@@ -791,22 +1113,16 @@ impl CompositorHandler for App {
             return;
         }
 
-        let entries = self
+        let is_menu = self
             .menu_surface
             .as_ref()
-            .filter(|menu| menu.layer.wl_surface() == wayland_surface)
-            .map(|menu| menu.entries.clone());
-        if let Some(entries) = entries {
-            let prepared = self.renderer.prepare_menu(&entries, factor);
-            let menu = self
-                .menu_surface
-                .as_mut()
-                .expect("menu remains available while rebuilding scale");
+            .filter(|menu| menu.popup.wl_surface() == wayland_surface)
+            .is_some();
+        if is_menu {
+            let menu = self.menu_surface.as_mut().expect("menu remains available");
             menu.scale = factor;
-            let _ = menu.layer.set_buffer_scale(factor);
-            menu.prepared = prepared;
-            menu.buffers.clear();
-            menu.dirty = true;
+            menu.popup.wl_surface().set_buffer_scale(factor as i32);
+            self.update_menu_page();
         }
     }
 
@@ -838,7 +1154,7 @@ impl CompositorHandler for App {
         if let Some(menu) = self
             .menu_surface
             .as_mut()
-            .filter(|menu| menu.layer.wl_surface() == wayland_surface)
+            .filter(|menu| menu.popup.wl_surface() == wayland_surface)
         {
             menu.frame_pending = false;
         }
@@ -887,8 +1203,8 @@ impl OutputHandler for App {
         _: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        self.surfaces.retain(|surface| surface.output != output);
         self.menu_surface = None;
+        self.surfaces.retain(|surface| surface.output != output);
         self.assign_workspace_groups();
     }
 }
@@ -898,12 +1214,10 @@ impl LayerShellHandler for App {
         if self
             .menu_surface
             .as_ref()
-            .is_some_and(|menu| &menu.layer == layer)
+            .is_some_and(|menu| &menu.parent == layer)
         {
             self.menu_surface = None;
-            return;
         }
-
         self.surfaces.retain(|surface| &surface.layer != layer);
         self.assign_workspace_groups();
     }
@@ -916,31 +1230,6 @@ impl LayerShellHandler for App {
         configure: LayerSurfaceConfigure,
         _: u32,
     ) {
-        if let Some(menu) = self
-            .menu_surface
-            .as_mut()
-            .filter(|menu| &menu.layer == layer)
-        {
-            let width = if configure.new_size.0 > 0 {
-                configure.new_size.0
-            } else {
-                menu.logical_width
-            };
-            let height = if configure.new_size.1 > 0 {
-                configure.new_size.1
-            } else {
-                menu.logical_height
-            };
-            if menu.logical_width != width || menu.logical_height != height {
-                menu.buffers.clear();
-            }
-            menu.logical_width = width;
-            menu.logical_height = height;
-            menu.configured = width > 0 && height > 0;
-            menu.dirty = true;
-            return;
-        }
-
         let Some(surface) = self
             .surfaces
             .iter_mut()
@@ -979,6 +1268,75 @@ impl LayerShellHandler for App {
     }
 }
 
+impl PopupHandler for App {
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        popup: &Popup,
+        configure: PopupConfigure,
+    ) {
+        let Some(menu) = self
+            .menu_surface
+            .as_mut()
+            .filter(|menu| &menu.popup == popup)
+        else {
+            return;
+        };
+        let width = u32::try_from(configure.width).unwrap_or(menu.logical_width);
+        let height = u32::try_from(configure.height).unwrap_or(menu.logical_height);
+        if menu.logical_width != width || menu.logical_height != height {
+            menu.buffers.clear();
+        }
+        menu.prepared.constrain(
+            width.saturating_mul(menu.scale),
+            height.saturating_mul(menu.scale),
+        );
+        menu.logical_width = width;
+        menu.logical_height = height;
+        menu.configured = width > 0 && height > 0;
+        menu.dirty = true;
+    }
+
+    fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &Popup) {
+        if self
+            .menu_surface
+            .as_ref()
+            .is_some_and(|menu| &menu.popup == popup)
+        {
+            self.menu_surface = None;
+        }
+    }
+}
+
+impl WindowHandler for App {
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Window) {}
+
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &Window,
+        _: WindowConfigure,
+        _: u32,
+    ) {
+    }
+}
+
+impl DialogHandler for App {
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Dialog) {}
+
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &Dialog,
+        _: WindowConfigure,
+        _: u32,
+    ) {
+    }
+}
+
 impl ShmHandler for App {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm
@@ -990,7 +1348,7 @@ impl ProvidesRegistryState for App {
         &mut self.registry_state
     }
 
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 impl SeatHandler for App {
@@ -1009,6 +1367,14 @@ impl SeatHandler for App {
                 true
             }
         });
+        self.keyboards.retain(|(current, keyboard)| {
+            if current == &seat {
+                keyboard.release();
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn new_capability(
@@ -1022,8 +1388,16 @@ impl SeatHandler for App {
             && !self.pointers.iter().any(|(current, _)| current == &seat)
         {
             match self.seat_state.get_pointer(queue_handle, &seat) {
-                Ok(pointer) => self.pointers.push((seat, pointer)),
+                Ok(pointer) => self.pointers.push((seat.clone(), pointer)),
                 Err(error) => log::warn!("failed to create Wayland pointer: {error}"),
+            }
+        }
+        if capability == Capability::Keyboard
+            && !self.keyboards.iter().any(|(current, _)| current == &seat)
+        {
+            match self.seat_state.get_keyboard(queue_handle, &seat, None) {
+                Ok(keyboard) => self.keyboards.push((seat, keyboard)),
+                Err(error) => log::warn!("failed to create Wayland keyboard: {error}"),
             }
         }
     }
@@ -1045,6 +1419,104 @@ impl SeatHandler for App {
                 }
             });
         }
+        if capability == Capability::Keyboard {
+            self.keyboards.retain(|(current, keyboard)| {
+                if current == &seat {
+                    keyboard.release();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+}
+
+impl KeyboardHandler for App {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+        if let Some(menu) = self
+            .menu_surface
+            .as_mut()
+            .filter(|menu| menu.popup.wl_surface() == surface)
+        {
+            let selected = menu.prepared.next_selection(None, false);
+            if menu.selected != selected {
+                menu.selected = selected;
+                menu.dirty = true;
+            }
+        }
+    }
+
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        if self
+            .menu_surface
+            .as_ref()
+            .is_some_and(|menu| menu.popup.wl_surface() == surface)
+        {
+            self.menu_surface = None;
+        }
+    }
+
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        self.handle_menu_key(event.keysym);
+    }
+
+    fn repeat_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        if matches!(event.keysym, Keysym::Up | Keysym::Down) {
+            self.handle_menu_key(event.keysym);
+        }
+    }
+
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: Modifiers,
+        _: RawModifiers,
+        _: u32,
+    ) {
     }
 }
 
@@ -1053,18 +1525,78 @@ impl PointerHandler for App {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_pointer::WlPointer,
+        pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
-        events
-            .iter()
-            .filter_map(|event| match event.kind {
-                PointerEventKind::Press { button, .. } => Some((event, button)),
-                _ => None,
-            })
-            .for_each(|(event, button)| {
-                self.handle_click(&event.surface, button, event.position.0, event.position.1);
-            });
+        for event in events {
+            let is_menu = self
+                .menu_surface
+                .as_ref()
+                .is_some_and(|menu| menu.popup.wl_surface() == &event.surface);
+            match event.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } if is_menu => {
+                    if let Some(menu) = self.menu_surface.as_mut() {
+                        let x = (event.position.0 * menu.scale as f64).floor() as i32;
+                        let y = (event.position.1 * menu.scale as f64).floor() as i32;
+                        let selected = menu.prepared.selection_at(x, y);
+                        if menu.selected != selected {
+                            menu.selected = selected;
+                            menu.dirty = true;
+                        }
+                    }
+                }
+                PointerEventKind::Leave { .. } if is_menu => {
+                    if let Some(menu) = self.menu_surface.as_mut()
+                        && menu.selected.take().is_some()
+                    {
+                        menu.dirty = true;
+                    }
+                }
+                PointerEventKind::Axis { vertical, .. } if is_menu => {
+                    if let Some(menu) = self.menu_surface.as_mut() {
+                        let logical_delta = if vertical.absolute != 0.0 {
+                            vertical.absolute
+                        } else if vertical.value120 != 0 {
+                            f64::from(vertical.value120) * 32.0 / 120.0
+                        } else {
+                            f64::from(vertical.discrete) * 32.0
+                        };
+                        let physical_delta = (logical_delta * f64::from(menu.scale))
+                            .round()
+                            .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
+                            as i32;
+                        if menu.prepared.scroll_by(physical_delta) {
+                            menu.selected = None;
+                            menu.dirty = true;
+                        }
+                    }
+                }
+                PointerEventKind::Press { button, serial, .. } => {
+                    self.pending_menu_grab = None;
+                    if button == BTN_RIGHT
+                        && self
+                            .surfaces
+                            .iter()
+                            .any(|bar| bar.layer.wl_surface() == &event.surface)
+                    {
+                        let bar = self
+                            .surfaces
+                            .iter()
+                            .find(|bar| bar.layer.wl_surface() == &event.surface)
+                            .expect("bar surface was checked above");
+                        let global_x = bar.output_position.0 + event.position.0.round() as i32;
+                        let global_y = bar.output_position.1 + event.position.1.round() as i32;
+                        self.pending_menu_grab = self
+                            .pointers
+                            .iter()
+                            .find(|(_, current)| current == pointer)
+                            .map(|(seat, _)| (seat.clone(), serial, global_x, global_y));
+                    }
+                    self.handle_click(&event.surface, button, event.position.0, event.position.1)
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1112,6 +1644,57 @@ fn preferred_shm_format(formats: &[wl_shm::Format]) -> wl_shm::Format {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_pointer_buttons_have_distinct_actions() {
+        assert_eq!(
+            menu_input_action(BTN_LEFT, Some(MenuSelection::Item(7)), false, true),
+            MenuInputAction::Activate(7)
+        );
+        assert_eq!(
+            menu_input_action(BTN_LEFT, Some(MenuSelection::Item(7)), true, true),
+            MenuInputAction::OpenSubmenu(7)
+        );
+        assert_eq!(
+            menu_input_action(BTN_LEFT, Some(MenuSelection::Back), false, true),
+            MenuInputAction::Back
+        );
+        assert_eq!(
+            menu_input_action(BTN_RIGHT, Some(MenuSelection::Item(7)), false, true),
+            MenuInputAction::Back
+        );
+        assert_eq!(
+            menu_input_action(BTN_RIGHT, None, false, false),
+            MenuInputAction::Dismiss
+        );
+        assert_eq!(
+            menu_input_action(0x112, Some(MenuSelection::Item(7)), false, true),
+            MenuInputAction::None
+        );
+    }
+
+    #[test]
+    fn menu_keyboard_actions_match_pointer_semantics() {
+        assert_eq!(
+            menu_input_action(BTN_LEFT, None, false, true),
+            MenuInputAction::None
+        );
+        assert_eq!(
+            menu_input_action(BTN_LEFT, Some(MenuSelection::Back), false, false),
+            MenuInputAction::Back
+        );
+    }
+
+    #[test]
+    fn menu_dimensions_only_clamp_to_known_output_bounds() {
+        assert_eq!(bounded_dimension(320, 1920), 320);
+        assert_eq!(bounded_dimension(2200, 1920), 1920);
+        assert_eq!(bounded_dimension(320, 0), 320);
+        assert_eq!(bounded_dimension(0, 1080), 1);
+        assert_eq!(menu_top(28, 400, 1080), 28);
+        assert_eq!(menu_top(28, 1070, 1080), 10);
+        assert_eq!(menu_top(28, 400, 0), 28);
+    }
 
     fn sample_content(keyboard_layout: &str, task_id: u64) -> crate::niri::SurfaceContent {
         crate::niri::SurfaceContent {

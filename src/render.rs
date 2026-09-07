@@ -42,27 +42,24 @@ fn fontconfig_font_path(pattern: &str) -> Option<PathBuf> {
     {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
-            log::warn!(
-                "fc-match завершился с ошибкой для {pattern:?}: {}",
-                output.status
-            );
+            log::warn!("fc-match failed for {pattern:?}: {}", output.status);
             return None;
         }
         Err(error) => {
-            log::warn!("не удалось запустить fc-match для {pattern:?}: {error}");
+            log::warn!("failed to start fc-match for {pattern:?}: {error}");
             return None;
         }
     };
     let output = match std::str::from_utf8(&output.stdout) {
         Ok(output) => output,
         Err(error) => {
-            log::warn!("fc-match вернул некорректный UTF-8 для {pattern:?}: {error}");
+            log::warn!("fc-match returned invalid UTF-8 for {pattern:?}: {error}");
             return None;
         }
     };
     let path = font_path(output);
     if path.is_none() {
-        log::warn!("fc-match не вернул путь к шрифту для {pattern:?}");
+        log::warn!("fc-match did not return a font path for {pattern:?}");
     }
     path
 }
@@ -72,7 +69,7 @@ fn font_system(font_family: &str) -> FontSystem {
         fontconfig_font_path(font_family),
         fontconfig_font_path("sans-serif:lang=ja"),
     ]) else {
-        log::warn!("используется полная системная база шрифтов");
+        log::warn!("using the complete system font database");
         return FontSystem::new();
     };
     let mut database = cosmic_text::fontdb::Database::new();
@@ -81,14 +78,14 @@ fn font_system(font_family: &str) -> FontSystem {
         .all(|path| match database.load_font_file(&path) {
             Ok(()) => true,
             Err(error) => {
-                log::warn!("не удалось загрузить шрифт {}: {error}", path.display());
+                log::warn!("failed to load font {}: {error}", path.display());
                 false
             }
         })
     {
         FontSystem::new_with_locale_and_db("en-US".into(), database)
     } else {
-        log::warn!("используется полная системная база шрифтов");
+        log::warn!("using the complete system font database");
         FontSystem::new()
     }
 }

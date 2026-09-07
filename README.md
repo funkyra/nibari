@@ -52,6 +52,30 @@ theme; if it is missing, a stable colored placeholder is drawn.
 Left-click a workspace label to switch to that workspace on its monitor. Left-click
 anywhere on a task's icon or title button to focus that window.
 
+Control the running bar on all monitors:
+
+```sh
+nibari --hide
+nibari --show
+nibari --toggle
+```
+
+Hiding removes the bar and its reserved space, letting windows expand upwards.
+Showing it restores the bar and its reserved space. Repeating `--hide` or `--show`
+keeps the requested state. The bar stays hidden across workspace switches and
+monitor changes until you show it again. No separate daemon is needed: these
+commands signal the running bar using `pkill` from procps. They do not start a new
+bar or load its configuration. If the bar is not running, they report an error.
+
+Use the binary's full path if `nibari` is not installed in your `PATH`.
+The original `pkill -USR1 -x nibari` toggle also remains available.
+
+For example, add this binding inside `binds` in your niri config:
+
+```kdl
+Mod+Shift+B { spawn "nibari" "--toggle"; }
+```
+
 A left click on a tray icon triggers the main action, a middle click triggers the secondary
 action, and a right click opens the application's context menu.
 

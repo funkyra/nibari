@@ -80,9 +80,7 @@ impl Config {
         while let Some(arg) = args.next() {
             match arg.to_str() {
                 Some("-c" | "--config") => {
-                    let value = args
-                        .next()
-                        .context("после --config необходимо указать путь")?;
+                    let value = args.next().context("--config must be followed by a path")?;
                     path = Some(PathBuf::from(value));
                 }
                 Some("--print-default-config") => {
@@ -91,11 +89,11 @@ impl Config {
                 }
                 Some("-h" | "--help") => {
                     println!(
-                        "nibari [--config PATH]\n\n  -c, --config PATH          путь к конфигу\n      --print-default-config вывести конфиг по умолчанию"
+                        "nibari [--config PATH]\nnibari --hide | --show | --toggle\n\n  -c, --config PATH          path to the config file\n      --print-default-config print the default config\n      --hide                 hide the running bar and release its space\n      --show                 show the running bar\n      --toggle               toggle the running bar's visibility"
                     );
                     std::process::exit(0);
                 }
-                _ => bail!("неизвестный аргумент: {}", arg.to_string_lossy()),
+                _ => bail!("unknown argument: {}", arg.to_string_lossy()),
             }
         }
 
@@ -108,17 +106,17 @@ impl Config {
         let config = match path {
             Some(path) if path.exists() => {
                 let source = fs::read_to_string(&path)
-                    .with_context(|| format!("не удалось прочитать {}", path.display()))?;
+                    .with_context(|| format!("failed to read {}", path.display()))?;
                 let config: Self = toml::from_str(&source)
-                    .with_context(|| format!("ошибка в конфиге {}", path.display()))?;
+                    .with_context(|| format!("error in config {}", path.display()))?;
                 log::info!("config: {}", path.display());
                 config
             }
             Some(path) if explicit_path.is_some() => {
-                bail!("конфиг не найден: {}", path.display());
+                bail!("config not found: {}", path.display());
             }
             _ => {
-                log::info!("config: используются значения по умолчанию");
+                log::info!("config: using default values");
                 Self::default()
             }
         };
@@ -129,35 +127,35 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         if !(16..=256).contains(&self.height) {
-            bail!("height должен быть в диапазоне 16..=256");
+            bail!("height must be in the range 16..=256");
         }
         if !(6.0..=96.0).contains(&self.font_size) {
-            bail!("font_size должен быть в диапазоне 6..=96");
+            bail!("font_size must be in the range 6..=96");
         }
         if self.font_family.trim().is_empty() {
-            bail!("font_family не может быть пустым");
+            bail!("font_family cannot be empty");
         }
         if self.tray_icon_size == 0 || self.tray_icon_size > self.height {
-            bail!("tray_icon_size должен быть больше 0 и не больше height");
+            bail!("tray_icon_size must be greater than 0 and no greater than height");
         }
         if self.padding > 256 || self.tray_spacing > 256 {
-            bail!("padding и tray_spacing должны быть не больше 256");
+            bail!("padding and tray_spacing must be no greater than 256");
         }
         if !(16..=128).contains(&self.workspace_width) {
-            bail!("workspace_width должен быть в диапазоне 16..=128");
+            bail!("workspace_width must be in the range 16..=128");
         }
         if self.task_icon_size == 0 || self.task_icon_size > self.height {
-            bail!("task_icon_size должен быть больше 0 и не больше height");
+            bail!("task_icon_size must be greater than 0 and no greater than height");
         }
         if self.task_spacing > 256 || self.task_padding > 256 {
-            bail!("task_spacing и task_padding должны быть не больше 256");
+            bail!("task_spacing and task_padding must be no greater than 256");
         }
         if StrftimeItems::new(&self.clock_format).any(|item| item == Item::Error) {
-            bail!("clock_format содержит некорректную strftime-последовательность");
+            bail!("clock_format contains an invalid strftime sequence");
         }
 
-        parse_color(&self.background).context("некорректный background")?;
-        parse_color(&self.foreground).context("некорректный foreground")?;
+        parse_color(&self.background).context("invalid background")?;
+        parse_color(&self.foreground).context("invalid foreground")?;
         [
             (
                 "workspace_focused_background",
@@ -192,7 +190,7 @@ impl Config {
         .into_iter()
         .try_for_each(|(name, color)| {
             parse_color(color)
-                .with_context(|| format!("некорректный {name}"))
+                .with_context(|| format!("invalid {name}"))
                 .map(|_| ())
         })?;
         Ok(())
@@ -224,14 +222,14 @@ fn default_path() -> Option<PathBuf> {
 fn parse_color(value: &str) -> Result<[u8; 4]> {
     let hex = value
         .strip_prefix('#')
-        .context("ожидается цвет вида #RRGGBB или #RRGGBBAA")?;
+        .context("expected a color in the form #RRGGBB or #RRGGBBAA")?;
     if hex.len() != 6 && hex.len() != 8 {
-        bail!("ожидается цвет вида #RRGGBB или #RRGGBBAA");
+        bail!("expected a color in the form #RRGGBB or #RRGGBBAA");
     }
 
     let channel = |offset| {
         u8::from_str_radix(&hex[offset..offset + 2], 16)
-            .context("цвет содержит не шестнадцатеричную цифру")
+            .context("color contains a non-hexadecimal digit")
     };
 
     Ok([

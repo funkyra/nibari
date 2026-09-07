@@ -6,6 +6,7 @@ rust-version = "1.97.0"
 
 [dependencies]
 anyhow = "1.0.104"
+calloop = { version = "0.14.4", features = ["signals"] }
 calloop-wayland-source = "0.4.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 cosmic-text = "0.19.0"

@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
+use calloop::signals::{Signal, Signals};
 use calloop_wayland_source::WaylandSource;
 use chrono::{
     Local, Timelike,
@@ -65,25 +66,39 @@ const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 
 pub fn run(config: Config) -> Result<()> {
-    let connection = Connection::connect_to_env().context("не удалось подключиться к Wayland")?;
+    // Block control signals before starting worker threads so they inherit the mask.
+    let signals = Signals::new(&[Signal::SIGUSR1, Signal::SIGUSR2, Signal::SIGHUP])
+        .context("failed to register control signals")?;
+    let connection = Connection::connect_to_env().context("failed to connect to Wayland")?;
     let (globals, event_queue) =
-        registry_queue_init(&connection).context("не удалось получить Wayland globals")?;
+        registry_queue_init(&connection).context("failed to obtain Wayland globals")?;
     let queue_handle = event_queue.handle();
 
     let compositor = CompositorState::bind(&globals, &queue_handle)
-        .context("compositor не предоставляет wl_compositor")?;
+        .context("compositor does not provide wl_compositor")?;
     let layer_shell = LayerShell::bind(&globals, &queue_handle)
-        .context("compositor не предоставляет wlr-layer-shell")?;
+        .context("compositor does not provide wlr-layer-shell")?;
     let xdg_shell =
         XdgShell::bind(&globals, &queue_handle).context("compositor does not provide xdg-shell")?;
     let shm =
-        Shm::bind(&globals, &queue_handle).context("compositor не предоставляет shared memory")?;
+        Shm::bind(&globals, &queue_handle).context("compositor does not provide shared memory")?;
 
     let mut event_loop: EventLoop<App> =
-        EventLoop::try_new().context("не удалось создать event loop")?;
+        EventLoop::try_new().context("failed to create the event loop")?;
+    event_loop
+        .handle()
+        .insert_source(signals, |event, _, app| match event.signal() {
+            Signal::SIGUSR1 => app.set_bars_hidden(!app.bars_hidden),
+            Signal::SIGUSR2 => app.set_bars_hidden(true),
+            Signal::SIGHUP => app.set_bars_hidden(false),
+            _ => {}
+        })
+        .map_err(|error| {
+            anyhow::anyhow!("failed to register signals with the event loop: {error}")
+        })?;
     WaylandSource::new(connection, event_queue)
         .insert(event_loop.handle())
-        .context("не удалось подключить Wayland к event loop")?;
+        .context("failed to attach Wayland to the event loop")?;
 
     let (tray_events, tray_channel) = channel::channel();
     let tray = TrayHandle::spawn(tray_events, &config);
@@ -105,6 +120,7 @@ pub fn run(config: Config) -> Result<()> {
         config,
         renderer,
         background_opaque,
+        bars_hidden: false,
         surfaces: Vec::new(),
         menu_surface: None,
         pointers: Vec::new(),
@@ -133,7 +149,7 @@ pub fn run(config: Config) -> Result<()> {
                 }
             }
         })
-        .map_err(|error| anyhow::anyhow!("не удалось подключить systray к event loop: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("failed to attach systray to the event loop: {error}"))?;
 
     event_loop
         .handle()
@@ -147,7 +163,7 @@ pub fn run(config: Config) -> Result<()> {
                 }
             }
         })
-        .map_err(|error| anyhow::anyhow!("не удалось подключить niri IPC к event loop: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("failed to attach niri IPC to the event loop: {error}"))?;
 
     event_loop
         .handle()
@@ -155,12 +171,12 @@ pub fn run(config: Config) -> Result<()> {
             app.update_clock();
             TimeoutAction::ToDuration(app.next_clock_delay())
         })
-        .map_err(|error| anyhow::anyhow!("не удалось запустить таймер часов: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("failed to start the clock timer: {error}"))?;
 
     loop {
         event_loop
             .dispatch(None, &mut app)
-            .context("ошибка event loop")?;
+            .context("event loop error")?;
         app.draw_dirty()?;
     }
 }
@@ -236,6 +252,7 @@ struct App {
     config: Config,
     renderer: Renderer,
     background_opaque: bool,
+    bars_hidden: bool,
     surfaces: Vec<BarSurface>,
     menu_surface: Option<MenuSurface>,
     pointers: Vec<(wl_seat::WlSeat, wl_pointer::WlPointer)>,
@@ -277,8 +294,30 @@ enum ClockGranularity {
 }
 
 impl App {
+    fn set_bars_hidden(&mut self, hidden: bool) {
+        if self.bars_hidden == hidden {
+            return;
+        }
+        self.bars_hidden = hidden;
+        if self.bars_hidden {
+            self.menu_surface = None;
+            self.pending_menu_grab = None;
+            // Destroying the layer surfaces also releases their exclusive zones.
+            self.surfaces.clear();
+        } else {
+            let outputs: Vec<_> = self.output_state.outputs().collect();
+            for output in outputs {
+                self.add_output(output);
+            }
+        }
+        log::info!(
+            "bar visibility: {}",
+            if self.bars_hidden { "hidden" } else { "shown" }
+        );
+    }
+
     fn add_output(&mut self, output: wl_output::WlOutput) {
-        if self.surfaces.iter().any(|surface| surface.output == output) {
+        if self.bars_hidden || self.surfaces.iter().any(|surface| surface.output == output) {
             return;
         }
 
@@ -908,16 +947,16 @@ fn draw_surface(
     let width = surface
         .logical_width
         .checked_mul(surface.scale)
-        .context("слишком большая ширина output")?;
+        .context("output width is too large")?;
     let height = surface
         .logical_height
         .checked_mul(surface.scale)
-        .context("слишком большая высота bar")?;
+        .context("bar height is too large")?;
     if width == 0 || height == 0 {
         return Ok(());
     }
 
-    let stride = width.checked_mul(4).context("переполнение stride")?;
+    let stride = width.checked_mul(4).context("stride overflow")?;
     let content = &surface.content;
     let frame = FrameSpec {
         width,
@@ -946,16 +985,16 @@ fn draw_surface(
     if let Some(index) = reusable {
         surface.buffers[index]
             .attach_to(wayland_surface)
-            .context("не удалось повторно прикрепить Wayland buffer")?;
+            .context("failed to reattach the Wayland buffer")?;
     } else {
         let (buffer, canvas) = surface
             .pool
             .create_buffer(width as i32, height as i32, stride as i32, surface.format)
-            .context("не удалось создать Wayland buffer")?;
+            .context("failed to create the Wayland buffer")?;
         render_canvas(canvas, renderer, &mut surface.hitboxes, frame)?;
         buffer
             .attach_to(wayland_surface)
-            .context("не удалось прикрепить Wayland buffer")?;
+            .context("failed to attach the Wayland buffer")?;
         surface.buffers.push(buffer);
     }
     wayland_surface.damage_buffer(0, 0, width as i32, height as i32);
@@ -975,16 +1014,16 @@ fn draw_menu_surface(
     let width = surface
         .logical_width
         .checked_mul(surface.scale)
-        .context("слишком большая ширина tray menu")?;
+        .context("tray menu width is too large")?;
     let height = surface
         .logical_height
         .checked_mul(surface.scale)
-        .context("слишком большая высота tray menu")?;
+        .context("tray menu height is too large")?;
     if width == 0 || height == 0 {
         return Ok(());
     }
 
-    let stride = width.checked_mul(4).context("переполнение menu stride")?;
+    let stride = width.checked_mul(4).context("menu stride overflow")?;
     let wayland_surface = surface.popup.wl_surface();
     let frame = MenuFrame {
         width,
@@ -1013,12 +1052,12 @@ fn draw_menu_surface(
     if let Some(index) = reusable {
         surface.buffers[index]
             .attach_to(wayland_surface)
-            .context("не удалось повторно прикрепить Wayland menu buffer")?;
+            .context("failed to reattach the Wayland menu buffer")?;
     } else {
         let (buffer, canvas) = surface
             .pool
             .create_buffer(width as i32, height as i32, stride as i32, surface.format)
-            .context("не удалось создать Wayland menu buffer")?;
+            .context("failed to create the Wayland menu buffer")?;
         render_menu_canvas(
             canvas,
             renderer,
@@ -1029,7 +1068,7 @@ fn draw_menu_surface(
         )?;
         buffer
             .attach_to(wayland_surface)
-            .context("не удалось прикрепить Wayland menu buffer")?;
+            .context("failed to attach the Wayland menu buffer")?;
         surface.buffers.push(buffer);
     }
 
@@ -1048,8 +1087,8 @@ fn render_canvas(
     hitboxes: &mut Vec<Hitbox>,
     frame: FrameSpec<'_>,
 ) -> Result<()> {
-    let mut pixmap = PixmapMut::from_bytes(canvas, frame.width, frame.height)
-        .context("некорректный размер pixmap")?;
+    let mut pixmap =
+        PixmapMut::from_bytes(canvas, frame.width, frame.height).context("invalid pixmap size")?;
     renderer.draw(
         &mut pixmap,
         RenderContent {
@@ -1076,7 +1115,7 @@ fn render_menu_canvas(
     frame: MenuFrame,
 ) -> Result<()> {
     let mut pixmap = PixmapMut::from_bytes(canvas, frame.width, frame.height)
-        .context("некорректный размер menu pixmap")?;
+        .context("invalid menu pixmap size")?;
     renderer.draw_menu(&mut pixmap, menu, hitboxes, selected);
     convert_canvas_for_wayland(&mut pixmap, frame.format);
     Ok(())
@@ -1084,7 +1123,7 @@ fn render_menu_canvas(
 
 fn convert_canvas_for_wayland(pixmap: &mut PixmapMut<'_>, format: wl_shm::Format) {
     if format == wl_shm::Format::Argb8888 {
-        // tiny-skia: RGBA; wl_shm ARGB8888 на little-endian: BGRA.
+        // tiny-skia: RGBA; wl_shm ARGB8888 on little-endian systems: BGRA.
         pixmap
             .data_mut()
             .chunks_exact_mut(4)

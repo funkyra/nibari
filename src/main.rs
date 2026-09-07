@@ -3,6 +3,7 @@ mod config;
 mod control;
 mod icons;
 mod logger;
+mod memory;
 mod niri;
 mod render;
 mod tray;

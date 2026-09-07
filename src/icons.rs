@@ -218,7 +218,33 @@ fn is_named_icon(path: &Path, name: &str) -> bool {
 
 fn load_icon_file(path: &Path, target_size: u32) -> Option<Pixmap> {
     match path.extension().and_then(|extension| extension.to_str()) {
-        Some(extension) if extension.eq_ignore_ascii_case("png") => Pixmap::load_png(path).ok(),
+        Some(extension) if extension.eq_ignore_ascii_case("png") => {
+            let image = Pixmap::load_png(path).ok()?;
+            let size = target_size.saturating_mul(2).clamp(32, 256);
+            let largest = image.width().max(image.height());
+            if largest <= size {
+                return Some(image);
+            }
+            let scale = size as f32 / largest as f32;
+            let width = (image.width() as f32 * scale).round().max(1.0) as u32;
+            let height = (image.height() as f32 * scale).round().max(1.0) as u32;
+            let mut resized = Pixmap::new(width, height)?;
+            resized.draw_pixmap(
+                0,
+                0,
+                image.as_ref(),
+                &tiny_skia::PixmapPaint {
+                    quality: tiny_skia::FilterQuality::Bicubic,
+                    ..Default::default()
+                },
+                tiny_skia::Transform::from_scale(
+                    width as f32 / image.width() as f32,
+                    height as f32 / image.height() as f32,
+                ),
+                None,
+            );
+            Some(resized)
+        }
         Some(extension) if extension.eq_ignore_ascii_case("svg") => {
             let data = std::fs::read(path).ok()?;
             render_svg(
@@ -288,6 +314,30 @@ pub fn image_revision(image: &Pixmap) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn png_backing_image_is_small_and_preserves_aspect_ratio() {
+        let path = std::env::temp_dir().join(format!("nibari-png-{}.png", std::process::id()));
+        let mut original = Pixmap::new(512, 256).unwrap();
+        original.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 128));
+        original.save_png(&path).unwrap();
+        let image = load_icon_file(&path, 18).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!((image.width(), image.height()), (36, 18));
+        let pixel = image.pixel(18, 9).unwrap();
+        assert_eq!(pixel.alpha(), 128);
+        assert_eq!(pixel.red(), 128);
+    }
+
+    #[test]
+    fn small_png_is_not_upscaled_in_the_cache() {
+        let path =
+            std::env::temp_dir().join(format!("nibari-small-png-{}.png", std::process::id()));
+        Pixmap::new(16, 8).unwrap().save_png(&path).unwrap();
+        let image = load_icon_file(&path, 18).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!((image.width(), image.height()), (16, 8));
+    }
 
     #[test]
     fn extracts_icon_from_desktop_entry() {

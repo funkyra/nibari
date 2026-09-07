@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use calloop::signals::{Signal, Signals};
@@ -13,7 +16,7 @@ use smithay_client_toolkit::{
     delegate_registry,
     output::{OutputHandler, OutputState},
     reexports::calloop::{
-        EventLoop,
+        EventLoop, LoopHandle,
         channel::{self, Event as ChannelEvent},
         timer::{TimeoutAction, Timer},
     },
@@ -51,6 +54,7 @@ use wayland_client::{
 
 use crate::{
     config::Config,
+    memory::{self, TrimSchedule},
     niri::{
         self, FocusCommand, NiriEvent, NiriHandle, NiriModel, SurfaceContent,
         WORKSPACES_PER_OUTPUT, WindowTask, WorkspaceSlot,
@@ -117,12 +121,15 @@ pub fn run(config: Config) -> Result<()> {
         xdg_shell,
         shm,
         queue_handle,
+        loop_handle: event_loop.handle(),
+        trim_schedule: TrimSchedule::default(),
         config,
         renderer,
         background_opaque,
         bars_hidden: false,
         surfaces: Vec::new(),
         menu_surface: None,
+        menu_was_open: false,
         pointers: Vec::new(),
         keyboards: Vec::new(),
         pending_menu_grab: None,
@@ -134,6 +141,7 @@ pub fn run(config: Config) -> Result<()> {
         tray,
     };
     app.update_clock();
+    app.schedule_memory_trim();
 
     event_loop
         .handle()
@@ -141,8 +149,17 @@ pub fn run(config: Config) -> Result<()> {
             if let ChannelEvent::Msg(event) = event {
                 match event {
                     TrayEvent::Items(items) if app.tray_icons != items => {
+                        app.renderer.retain_tray_icons(&items);
+                        if app
+                            .menu_surface
+                            .as_ref()
+                            .is_some_and(|menu| !items.iter().any(|icon| icon.id == menu.address))
+                        {
+                            app.menu_surface = None;
+                        }
                         app.tray_icons = items;
                         app.mark_bars_dirty();
+                        app.schedule_memory_trim();
                     }
                     TrayEvent::Items(_) => {}
                     TrayEvent::Menu(menu) => app.show_menu(menu),
@@ -156,9 +173,13 @@ pub fn run(config: Config) -> Result<()> {
         .insert_source(niri_channel, |event, _, app| {
             if let ChannelEvent::Msg(event) = event {
                 match event {
-                    NiriEvent::State(model) => app.update_niri_model(model),
+                    NiriEvent::State(model) => {
+                        app.update_niri_model(model);
+                        app.schedule_memory_trim();
+                    }
                     NiriEvent::WindowClosed(window_id) => {
-                        app.renderer.evict_task_text(window_id);
+                        app.renderer.evict_window(window_id);
+                        app.schedule_memory_trim();
                     }
                 }
             }
@@ -202,6 +223,7 @@ struct BarSurface {
 }
 
 struct MenuSurface {
+    seat: wl_seat::WlSeat,
     popup: Popup,
     parent: LayerSurface,
     pool: SlotPool,
@@ -249,12 +271,15 @@ struct App {
     xdg_shell: XdgShell,
     shm: Shm,
     queue_handle: QueueHandle<Self>,
+    loop_handle: LoopHandle<'static, Self>,
+    trim_schedule: TrimSchedule,
     config: Config,
     renderer: Renderer,
     background_opaque: bool,
     bars_hidden: bool,
     surfaces: Vec<BarSurface>,
     menu_surface: Option<MenuSurface>,
+    menu_was_open: bool,
     pointers: Vec<(wl_seat::WlSeat, wl_pointer::WlPointer)>,
     keyboards: Vec<(wl_seat::WlSeat, wl_keyboard::WlKeyboard)>,
     pending_menu_grab: Option<(wl_seat::WlSeat, u32, i32, i32)>,
@@ -294,11 +319,32 @@ enum ClockGranularity {
 }
 
 impl App {
+    fn schedule_memory_trim(&mut self) {
+        if !cfg!(all(target_os = "linux", target_env = "gnu")) {
+            return;
+        }
+        let Some(delay) = self.trim_schedule.request(Instant::now()) else {
+            return;
+        };
+        if let Err(error) =
+            self.loop_handle
+                .insert_source(Timer::from_duration(delay), |_, _, app| {
+                    memory::reclaim();
+                    app.trim_schedule.completed(Instant::now());
+                    TimeoutAction::Drop
+                })
+        {
+            self.trim_schedule.cancel();
+            log::warn!("failed to schedule memory reclamation: {error}");
+        }
+    }
+
     fn set_bars_hidden(&mut self, hidden: bool) {
         if self.bars_hidden == hidden {
             return;
         }
         self.bars_hidden = hidden;
+        self.schedule_memory_trim();
         if self.bars_hidden {
             self.menu_surface = None;
             self.pending_menu_grab = None;
@@ -471,6 +517,25 @@ impl App {
     }
 
     fn draw_dirty(&mut self) -> Result<()> {
+        let menu_open = self.menu_surface.is_some();
+        if self.menu_was_open != menu_open {
+            self.menu_was_open = menu_open;
+            self.schedule_memory_trim();
+        }
+        // All dismissal paths converge here, including hiding and tray removal.
+        let menu_seat = self.menu_surface.as_ref().map(|menu| &menu.seat);
+        let old_count = self.keyboards.len();
+        self.keyboards.retain(|(seat, keyboard)| {
+            if Some(seat) == menu_seat {
+                true
+            } else {
+                keyboard.release();
+                false
+            }
+        });
+        if old_count != self.keyboards.len() {
+            self.schedule_memory_trim();
+        }
         let queue_handle = &self.queue_handle;
         let clock = &self.clock;
         let tray_icons = &self.tray_icons;
@@ -504,6 +569,10 @@ impl App {
     }
 
     fn show_menu(&mut self, menu: TrayMenuPopup) {
+        // A DBus reply can arrive after the application has disappeared.
+        if !self.tray_icons.iter().any(|icon| icon.id == menu.address) {
+            return;
+        }
         let Some(target) = self.menu_target(menu.x, menu.y) else {
             return;
         };
@@ -573,6 +642,15 @@ impl App {
 
         // Niri grants keyboard grabs only to popups whose parent accepts focus.
         // Restore the panel's normal non-interactive state when this menu drops.
+        if !self.keyboards.iter().any(|(current, _)| current == &seat) {
+            match self
+                .seat_state
+                .get_keyboard(&self.queue_handle, &seat, None)
+            {
+                Ok(keyboard) => self.keyboards.push((seat.clone(), keyboard)),
+                Err(error) => log::warn!("failed to create menu keyboard: {error}"),
+            }
+        }
         target
             .parent
             .set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
@@ -582,6 +660,7 @@ impl App {
         popup.wl_surface().commit();
 
         self.menu_surface = Some(MenuSurface {
+            seat,
             popup,
             parent: target.parent,
             pool,
@@ -1432,6 +1511,10 @@ impl SeatHandler for App {
             }
         }
         if capability == Capability::Keyboard
+            && self
+                .menu_surface
+                .as_ref()
+                .is_some_and(|menu| menu.seat == seat)
             && !self.keyboards.iter().any(|(current, _)| current == &seat)
         {
             match self.seat_state.get_keyboard(queue_handle, &seat, None) {

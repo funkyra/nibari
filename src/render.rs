@@ -402,8 +402,14 @@ impl Renderer {
         }
     }
 
-    pub fn evict_task_text(&mut self, window_id: u64) {
+    pub fn evict_window(&mut self, window_id: u64) {
         self.task_text_cache.retain(|entry| entry.id != window_id);
+        self.task_icon_cache.retain(|entry| entry.id != window_id);
+    }
+
+    pub fn retain_tray_icons(&mut self, tray: &[TrayIcon]) {
+        self.icon_cache
+            .retain(|cached| tray.iter().any(|icon| icon.id == cached.id));
     }
 
     pub fn draw(
@@ -468,8 +474,7 @@ impl Renderer {
             return;
         }
 
-        self.icon_cache
-            .retain(|cached| tray.iter().any(|icon| icon.id == cached.id));
+        self.retain_tray_icons(tray);
         hitboxes.reserve(tray.len());
 
         for (index, icon) in tray.iter().enumerate() {
@@ -1269,6 +1274,12 @@ mod tests {
         let mut renderer = Renderer::new(&Config::default());
         renderer.task_text_cache.reserve(8);
         for (id, scale) in [(7, 1), (7, 2), (9, 1)] {
+            renderer.task_icon_cache.push(TaskIconBitmap {
+                id,
+                scale,
+                revision: 1,
+                pixels: vec![255; 4],
+            });
             renderer.task_text_cache.push(TaskTextBitmap {
                 id,
                 label: format!("window-{id}"),
@@ -1279,7 +1290,7 @@ mod tests {
         }
         let capacity = renderer.task_text_cache.capacity();
 
-        renderer.evict_task_text(7);
+        renderer.evict_window(7);
 
         assert_eq!(
             renderer
@@ -1290,6 +1301,36 @@ mod tests {
             [(9, 1)]
         );
         assert_eq!(renderer.task_text_cache.capacity(), capacity);
+        assert_eq!(
+            renderer
+                .task_icon_cache
+                .iter()
+                .map(|entry| (entry.id, entry.scale))
+                .collect::<Vec<_>>(),
+            [(9, 1)]
+        );
+    }
+
+    #[test]
+    fn tray_removal_evicts_all_scales_without_drawing() {
+        let mut renderer = Renderer::new(&Config::default());
+        let icon = |id: &str| TrayIcon {
+            id: id.into(),
+            revision: 1,
+            pixels: Arc::from([255; 4]),
+            width: 1,
+            height: 1,
+        };
+        let removed = icon("removed");
+        let retained = icon("retained");
+        renderer.cached_icon(&removed, 1, 18);
+        renderer.cached_icon(&removed, 2, 36);
+        renderer.cached_icon(&retained, 1, 18);
+        renderer.retain_tray_icons(std::slice::from_ref(&retained));
+        assert_eq!(renderer.icon_cache.len(), 1);
+        assert_eq!(renderer.icon_cache[0].id, "retained");
+        renderer.retain_tray_icons(&[]);
+        assert!(renderer.icon_cache.is_empty());
     }
 
     #[test]

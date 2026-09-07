@@ -192,6 +192,36 @@ struct CachedIcon {
     icon: TrayIcon,
 }
 
+struct IconInput {
+    item_id: String,
+    theme_path: Option<String>,
+    name: Option<String>,
+    pixmap: Option<IconPixmap>,
+}
+
+impl IconInput {
+    fn from_item(item: &StatusNotifierItem, target_size: u32) -> Self {
+        let (name, pixmaps) = selected_icon(item);
+        Self {
+            item_id: item.id.clone(),
+            theme_path: item.icon_theme_path.clone(),
+            name: name.map(str::to_owned),
+            pixmap: pixmaps.and_then(|pixmaps| select_pixmap(pixmaps, target_size).cloned()),
+        }
+    }
+}
+
+enum PreparedIcon {
+    Cached(TrayIcon),
+    Refresh(IconInput),
+}
+
+struct PreparedItem {
+    address: String,
+    signature: u64,
+    icon: PreparedIcon,
+}
+
 fn changed_icon_address(update: &Event) -> Option<&str> {
     match update {
         Event::Add(address, _) | Event::Remove(address) => Some(address),
@@ -211,52 +241,98 @@ fn publish_items(
     last_snapshot: &mut Option<u64>,
 ) {
     let items = client.items();
-    let mut items: Vec<_> = items
-        .lock()
-        .expect("system-tray item lock poisoned")
-        .iter()
-        .map(|(address, (item, _))| (address.clone(), item.clone()))
-        .collect();
-    items.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let prepared = {
+        let items = items.lock().expect("system-tray item lock poisoned");
+        prepare_items(
+            items
+                .iter()
+                .map(|(address, (item, _))| (address.as_str(), item)),
+            settings.target_size,
+            cache,
+        )
+    };
+    let icons = realize_items(prepared, settings, cache);
 
-    cache.retain(|address, _| {
-        items
-            .binary_search_by(|(current, _)| current.as_str().cmp(address))
-            .is_ok()
-    });
-
-    let mut snapshot = Fnv64::new();
-    let icons: Vec<_> = items
-        .into_iter()
-        .map(|(address, item)| {
-            let signature = item_icon_signature(&item);
-            let stale = cache
-                .get(&address)
-                .is_none_or(|cached| cached.signature != signature);
-            if stale {
-                cache.insert(
-                    address.clone(),
-                    CachedIcon {
-                        signature,
-                        icon: make_icon(&address, &item, settings),
-                    },
-                );
-            }
-            let cached = cache
-                .get(&address)
-                .expect("tray icon was inserted immediately above");
-
-            snapshot.write(cached.icon.id.as_bytes());
-            snapshot.write_u64(cached.icon.revision);
-            cached.icon.clone()
-        })
-        .collect();
-
-    let snapshot = snapshot.finish();
-    if last_snapshot.replace(snapshot) != Some(snapshot) {
+    if snapshot_changed(&icons, last_snapshot) {
         log::info!("systray: {} item(s)", icons.len());
         let _ = events.send(TrayEvent::Items(icons));
     }
+}
+
+fn snapshot_changed(icons: &[TrayIcon], last_snapshot: &mut Option<u64>) -> bool {
+    let mut snapshot = Fnv64::new();
+    icons.iter().for_each(|icon| {
+        snapshot.write(icon.id.as_bytes());
+        snapshot.write_u64(icon.revision);
+    });
+    let snapshot = snapshot.finish();
+    last_snapshot.replace(snapshot) != Some(snapshot)
+}
+
+fn prepare_items<'a>(
+    items: impl IntoIterator<Item = (&'a str, &'a StatusNotifierItem)>,
+    target_size: u32,
+    cache: &mut HashMap<String, CachedIcon>,
+) -> Vec<PreparedItem> {
+    let mut prepared: Vec<_> = items
+        .into_iter()
+        .map(|(address, item)| {
+            let signature = item_icon_signature(item);
+            let icon = cache
+                .get(address)
+                .filter(|cached| cached.signature == signature)
+                .map_or_else(
+                    || PreparedIcon::Refresh(IconInput::from_item(item, target_size)),
+                    |cached| PreparedIcon::Cached(cached.icon.clone()),
+                );
+            PreparedItem {
+                address: address.to_owned(),
+                signature,
+                icon,
+            }
+        })
+        .collect();
+    prepared.sort_unstable_by(|left, right| left.address.cmp(&right.address));
+    cache.retain(|address, _| {
+        prepared
+            .binary_search_by(|current| current.address.as_str().cmp(address))
+            .is_ok()
+    });
+    prepared
+}
+
+fn realize_items(
+    prepared: Vec<PreparedItem>,
+    settings: &IconSettings,
+    cache: &mut HashMap<String, CachedIcon>,
+) -> Vec<TrayIcon> {
+    prepared
+        .into_iter()
+        .map(|prepared| match prepared.icon {
+            PreparedIcon::Cached(icon) => icon,
+            PreparedIcon::Refresh(input) => {
+                let icon = make_icon(&prepared.address, input, settings);
+                cache.insert(
+                    prepared.address,
+                    CachedIcon {
+                        signature: prepared.signature,
+                        icon: icon.clone(),
+                    },
+                );
+                icon
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn reconcile_items<'a>(
+    items: impl IntoIterator<Item = (&'a str, &'a StatusNotifierItem)>,
+    settings: &IconSettings,
+    cache: &mut HashMap<String, CachedIcon>,
+) -> Vec<TrayIcon> {
+    let prepared = prepare_items(items, settings.target_size, cache);
+    realize_items(prepared, settings, cache)
 }
 
 async fn execute_command(
@@ -476,17 +552,22 @@ fn infer_status_notifier_path_from_menu(menu_path: &str) -> Option<String> {
         .then(|| menu_path.replacen("DbusMenu", "StatusNotifierItem", 1))
 }
 
-fn make_icon(address: &str, item: &StatusNotifierItem, settings: &IconSettings) -> TrayIcon {
-    let (name, pixmaps) = selected_icon(item);
-
-    let image = name
+fn make_icon(address: &str, input: IconInput, settings: &IconSettings) -> TrayIcon {
+    let image = input
+        .name
+        .as_deref()
         .and_then(|name| {
             settings
                 .loader
-                .load(name, item.icon_theme_path.as_deref(), settings.target_size)
+                .load(name, input.theme_path.as_deref(), settings.target_size)
         })
-        .or_else(|| pixmaps.and_then(|pixmaps| load_pixmap(pixmaps, settings.target_size)))
-        .unwrap_or_else(|| fallback_icon(&item.id, settings.target_size));
+        .or_else(|| {
+            input
+                .pixmap
+                .as_ref()
+                .and_then(|pixmap| load_pixmap(std::slice::from_ref(pixmap), settings.target_size))
+        })
+        .unwrap_or_else(|| fallback_icon(&input.item_id, settings.target_size));
 
     TrayIcon {
         id: address.to_owned(),
@@ -583,19 +664,7 @@ impl Fnv64 {
 }
 
 fn load_pixmap(pixmaps: &[IconPixmap], target_size: u32) -> Option<Pixmap> {
-    let best = pixmaps
-        .iter()
-        .filter(|icon| {
-            icon.width > 0
-                && icon.height > 0
-                && icon.width <= 1024
-                && icon.height <= 1024
-                && icon.pixels.len() >= icon.width as usize * icon.height as usize * 4
-        })
-        .min_by_key(|icon| {
-            let size = icon.width.max(icon.height) as i64;
-            (size - target_size as i64).unsigned_abs()
-        })?;
+    let best = select_pixmap(pixmaps, target_size)?;
 
     let mut pixmap = Pixmap::new(best.width as u32, best.height as u32)?;
     for (source, target) in best
@@ -612,6 +681,22 @@ fn load_pixmap(pixmaps: &[IconPixmap], target_size: u32) -> Option<Pixmap> {
     Some(pixmap)
 }
 
+fn select_pixmap(pixmaps: &[IconPixmap], target_size: u32) -> Option<&IconPixmap> {
+    pixmaps
+        .iter()
+        .filter(|icon| {
+            icon.width > 0
+                && icon.height > 0
+                && icon.width <= 1024
+                && icon.height <= 1024
+                && icon.pixels.len() >= icon.width as usize * icon.height as usize * 4
+        })
+        .min_by_key(|icon| {
+            let size = icon.width.max(icon.height) as i64;
+            (size - target_size as i64).unsigned_abs()
+        })
+}
+
 fn premultiply(channel: u8, alpha: u8) -> u8 {
     ((channel as u16 * alpha as u16 + 127) / 255) as u8
 }
@@ -619,6 +704,133 @@ fn premultiply(channel: u8, alpha: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tray_item(id: &str, pixel: u8) -> StatusNotifierItem {
+        StatusNotifierItem {
+            id: id.to_owned(),
+            category: Default::default(),
+            title: None,
+            status: Status::Active,
+            window_id: 0,
+            icon_theme_path: None,
+            icon_name: None,
+            icon_pixmap: Some(vec![IconPixmap {
+                width: 1,
+                height: 1,
+                pixels: vec![255, pixel, 0, 0],
+            }]),
+            overlay_icon_name: None,
+            overlay_icon_pixmap: None,
+            attention_icon_name: None,
+            attention_icon_pixmap: None,
+            attention_movie_name: None,
+            tool_tip: None,
+            item_is_menu: false,
+            menu: None,
+        }
+    }
+
+    fn icon_settings() -> IconSettings {
+        IconSettings {
+            target_size: 16,
+            loader: IconLoader::new(&Config::default()),
+        }
+    }
+
+    #[test]
+    fn unchanged_item_reuses_pixel_allocation() {
+        let item = tray_item("test", 10);
+        let settings = icon_settings();
+        let mut cache = HashMap::new();
+        let first = reconcile_items([("address", &item)], &settings, &mut cache);
+        let second = reconcile_items([("address", &item)], &settings, &mut cache);
+
+        assert!(Arc::ptr_eq(&first[0].pixels, &second[0].pixels));
+    }
+
+    #[test]
+    fn unchanged_snapshot_does_not_request_another_ui_event() {
+        let item = tray_item("test", 10);
+        let settings = icon_settings();
+        let mut cache = HashMap::new();
+        let icons = reconcile_items([("address", &item)], &settings, &mut cache);
+        let mut last_snapshot = None;
+
+        assert!(snapshot_changed(&icons, &mut last_snapshot));
+        assert!(!snapshot_changed(&icons, &mut last_snapshot));
+    }
+
+    #[test]
+    fn changed_icon_refreshes_cached_pixels() {
+        let mut item = tray_item("test", 10);
+        let settings = icon_settings();
+        let mut cache = HashMap::new();
+        let first = reconcile_items([("address", &item)], &settings, &mut cache);
+        item.icon_pixmap.as_mut().unwrap()[0].pixels[1] = 20;
+        let second = reconcile_items([("address", &item)], &settings, &mut cache);
+
+        assert!(!Arc::ptr_eq(&first[0].pixels, &second[0].pixels));
+        assert_ne!(first[0].revision, second[0].revision);
+    }
+
+    #[test]
+    fn removed_items_disappear_and_release_cached_pixels() {
+        let item = tray_item("test", 10);
+        let settings = icon_settings();
+        let mut cache = HashMap::new();
+        let icons = reconcile_items([("address", &item)], &settings, &mut cache);
+        let pixels = Arc::downgrade(&icons[0].pixels);
+        drop(icons);
+
+        assert!(reconcile_items([], &settings, &mut cache).is_empty());
+        assert!(cache.is_empty());
+        assert!(pixels.upgrade().is_none());
+    }
+
+    #[test]
+    fn selected_pixmap_is_copied_without_copying_other_variants() {
+        let mut item = tray_item("test", 10);
+        item.icon_pixmap.as_mut().unwrap().push(IconPixmap {
+            width: 64,
+            height: 64,
+            pixels: vec![255; 64 * 64 * 4],
+        });
+
+        let input = IconInput::from_item(&item, 16);
+        assert_eq!(input.pixmap.as_ref().map(|pixmap| pixmap.width), Some(1));
+        assert_eq!(
+            input.pixmap.as_ref().map(|pixmap| pixmap.pixels.len()),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn missing_named_icon_falls_back_to_selected_pixmap() {
+        let mut item = tray_item("test", 77);
+        item.icon_name = Some("nibari-test-icon-that-does-not-exist".into());
+        let settings = icon_settings();
+        let input = IconInput::from_item(&item, settings.target_size);
+
+        let icon = make_icon("address", input, &settings);
+        assert_eq!(&*icon.pixels, &[77, 0, 0, 255]);
+    }
+
+    #[test]
+    fn attention_status_selects_attention_icon_with_normal_fallback() {
+        let mut item = tray_item("test", 10);
+        item.attention_icon_pixmap = Some(vec![IconPixmap {
+            width: 1,
+            height: 1,
+            pixels: vec![255, 99, 0, 0],
+        }]);
+        item.status = Status::NeedsAttention;
+        let attention = IconInput::from_item(&item, 16);
+        assert_eq!(attention.pixmap.unwrap().pixels[1], 99);
+
+        item.attention_icon_pixmap = None;
+        let normal_fallback = IconInput::from_item(&item, 16);
+        assert_eq!(normal_fallback.pixmap.unwrap().pixels[1], 10);
+    }
 
     fn dbus_menu_item(id: i32, label: &str) -> MenuItem {
         MenuItem {

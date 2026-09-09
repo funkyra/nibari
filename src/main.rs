@@ -6,6 +6,7 @@ mod logger;
 mod memory;
 mod niri;
 mod render;
+mod single_instance;
 mod tray;
 
 fn main() -> anyhow::Result<()> {
@@ -24,5 +25,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     let config = config::Config::load_from_args(args.into_iter())?;
+    let _instance = single_instance::acquire()?;
     bar::run(config)
 }

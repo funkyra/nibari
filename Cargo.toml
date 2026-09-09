@@ -1,6 +1,6 @@
 [package]
 name = "nibari"
-version = "1.0.2"
+version = "1.2.2"
 edition = "2024"
 rust-version = "1.97.0"
 
@@ -19,7 +19,7 @@ smithay-client-toolkit = "0.21.1"
 system-tray = "0.8.9"
 tiny-skia = "0.12.0"
 tokio = { version = "1.53.1", features = ["rt", "sync"] }
-toml = "1.1.4"
+toml = "1.1.5"
 wayland-client = "0.31.15"
 zbus = { version = "5.19.0", features = ["tokio"] }
 

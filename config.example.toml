@@ -5,6 +5,9 @@ font_family = "Fira Code Medium"
 font_size = 8.0
 
 # Цвета бара. Формат: #RRGGBB или #RRGGBBAA.
+# AA: 00 — прозрачный, 80 — полупрозрачный, FF — непрозрачный.
+# Например: background = "#28282800". Текст и иконки сохраняют свою прозрачность.
+# Фоны workspace и кнопок окон настраиваются отдельно ниже.
 background = "#282828"
 foreground = "#DCDCCC"
 
@@ -22,6 +25,8 @@ workspace_empty_foreground = "#6F6F6F"
 workspace_urgent_foreground = "#CC9393"
 
 # Окна активного workspace в центре.
+# false — скрыть список окон, сохранив workspaces, раскладку, трей и часы.
+show_tasks = true
 task_icon_size = 18
 task_spacing = 2
 task_padding = 6

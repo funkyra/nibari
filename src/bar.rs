@@ -1768,6 +1768,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canvas_preserves_background_alpha_in_wayland_formats() {
+        let workspaces = std::array::from_fn(|index| WorkspaceSlot {
+            index: index as u8 + 1,
+            ..WorkspaceSlot::default()
+        });
+        for (background, rgba) in [
+            ("#20406000", [0, 0, 0, 0]),
+            ("#20406080", [16, 32, 48, 128]),
+            ("#204060", [32, 64, 96, 255]),
+        ] {
+            let config = Config {
+                background: background.into(),
+                ..Config::default()
+            };
+            let mut renderer = Renderer::new(&config);
+            for format in [wl_shm::Format::Argb8888, wl_shm::Format::Abgr8888] {
+                // Reused buffers may contain an opaque previous frame.
+                let mut canvas = vec![255; 800 * config.height as usize * 4];
+                let mut hitboxes = Vec::new();
+                render_canvas(
+                    &mut canvas,
+                    &mut renderer,
+                    &mut hitboxes,
+                    FrameSpec {
+                        width: 800,
+                        height: config.height,
+                        scale: 1,
+                        format,
+                        clock: "12:00",
+                        keyboard_layout: "en",
+                        tray_icons: &[],
+                        workspaces: &workspaces,
+                        tasks: &[],
+                    },
+                )
+                .unwrap();
+                let mut expected = rgba;
+                if format == wl_shm::Format::Argb8888 {
+                    expected.swap(0, 2);
+                }
+                assert_eq!(&canvas[400 * 4..401 * 4], &expected);
+                assert_eq!(hitboxes.len(), WORKSPACES_PER_OUTPUT);
+                assert!(
+                    hitboxes
+                        .iter()
+                        .all(|hitbox| matches!(hitbox.target, HitTarget::Workspace { .. }))
+                );
+                if rgba[3] < 255 {
+                    // Antialiased glyphs need not have fully opaque pixels.
+                    assert!(canvas.chunks_exact(4).any(|pixel| pixel[3] > rgba[3]));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn menu_pointer_buttons_have_distinct_actions() {
         assert_eq!(
             menu_input_action(BTN_LEFT, Some(MenuSelection::Item(7)), false, true),

@@ -261,16 +261,21 @@ pub fn spawn(events: UiSender<NiriEvent>, config: &Config) -> NiriHandle {
 }
 
 fn listen_forever(events: UiSender<NiriEvent>, config: Config) {
-    let mut icons = ApplicationIconCache::new(&config);
+    let mut icons = config
+        .show_tasks
+        .then(|| ApplicationIconCache::new(&config));
     loop {
-        if let Err(error) = listen(&events, &mut icons) {
+        if let Err(error) = listen(&events, icons.as_mut()) {
             log::warn!("niri IPC: {error}; reconnecting");
             thread::sleep(Duration::from_secs(2));
         }
     }
 }
 
-fn listen(events: &UiSender<NiriEvent>, icons: &mut ApplicationIconCache) -> anyhow::Result<()> {
+fn listen(
+    events: &UiSender<NiriEvent>,
+    mut icons: Option<&mut ApplicationIconCache>,
+) -> anyhow::Result<()> {
     let mut socket = Socket::connect()?;
     match socket.send(Request::EventStream)? {
         Ok(Response::Handled) => log::info!("niri IPC: event stream connected"),
@@ -285,13 +290,15 @@ fn listen(events: &UiSender<NiriEvent>, icons: &mut ApplicationIconCache) -> any
     loop {
         let event = read_event()?;
         let relevant = affects_workspace_view(&event);
-        notify_window_closures(&state, &event, |id| {
-            events.send(NiriEvent::WindowClosed(id))?;
-            Ok(())
-        })?;
+        if icons.is_some() {
+            notify_window_closures(&state, &event, |id| {
+                events.send(NiriEvent::WindowClosed(id))?;
+                Ok(())
+            })?;
+        }
         let _ = state.apply(event);
         if relevant {
-            let next = Arc::new(niri_model(&state, icons));
+            let next = Arc::new(niri_model(&state, icons.as_deref_mut()));
             if next.as_ref() != previous.as_ref() {
                 events.send(NiriEvent::State(Arc::clone(&next)))?;
                 previous = next;
@@ -337,10 +344,13 @@ fn affects_workspace_view(event: &Event) -> bool {
     )
 }
 
-fn niri_model(state: &EventStreamState, icons: &mut ApplicationIconCache) -> NiriModel {
+fn niri_model(state: &EventStreamState, icons: Option<&mut ApplicationIconCache>) -> NiriModel {
     let workspaces = workspace_model(state);
-    let task_lists = task_lists(state, icons);
-    icons.retain_open_applications(state);
+    let task_lists = icons.map_or_else(Vec::new, |icons| {
+        let tasks = task_lists(state, icons);
+        icons.retain_open_applications(state);
+        tasks
+    });
     NiriModel {
         workspaces,
         task_lists,
@@ -586,6 +596,49 @@ mod tests {
             },
             focus_timestamp: None,
         }
+    }
+
+    #[test]
+    fn hidden_tasks_preserve_occupancy_and_ignore_title_changes() {
+        let mut state = EventStreamState::default();
+        let _ = state.apply(Event::WorkspacesChanged {
+            workspaces: vec![niri_ipc::Workspace {
+                id: 101,
+                idx: 1,
+                name: None,
+                output: Some("DP-1".into()),
+                is_urgent: false,
+                is_active: true,
+                is_focused: true,
+                active_window_id: Some(7),
+            }],
+        });
+        let mut window = sample_window(7);
+        window.workspace_id = Some(101);
+        window.title = Some("Terminal".into());
+        let _ = state.apply(Event::WindowOpenedOrChanged { window });
+
+        let hidden = niri_model(&state, None);
+        let content = hidden.surface_content(Some("DP-1"), 0);
+        assert!(hidden.task_lists.is_empty());
+        assert!(content.tasks.is_empty());
+        assert!(content.workspaces[0].is_occupied);
+        assert!(content.workspaces[0].is_focused);
+
+        state.windows.windows.get_mut(&7).unwrap().title = Some("New title".into());
+        assert_eq!(hidden, niri_model(&state, None));
+
+        let mut icons = ApplicationIconCache::new(&Config::default());
+        let shown = niri_model(&state, Some(&mut icons));
+        let content = shown.surface_content(Some("DP-1"), 0);
+        assert_eq!(content.tasks.len(), 1);
+        assert_eq!(content.tasks[0].id, 7);
+        assert_eq!(content.tasks[0].label, "New title");
+
+        let _ = state.apply(Event::WindowClosed { id: 7 });
+        let empty = niri_model(&state, None);
+        assert!(!empty.surface_content(Some("DP-1"), 0).workspaces[0].is_occupied);
+        assert_ne!(hidden, empty);
     }
 
     #[test]

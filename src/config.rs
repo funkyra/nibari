@@ -28,6 +28,7 @@ pub struct Config {
     pub workspace_occupied_foreground: String,
     pub workspace_empty_foreground: String,
     pub workspace_urgent_foreground: String,
+    pub show_tasks: bool,
     pub task_icon_size: u32,
     pub task_spacing: u32,
     pub task_padding: u32,
@@ -58,6 +59,7 @@ impl Default for Config {
             workspace_occupied_foreground: "#DCDCCC".into(),
             workspace_empty_foreground: "#6F6F6F".into(),
             workspace_urgent_foreground: "#CC9393".into(),
+            show_tasks: true,
             task_icon_size: 18,
             task_spacing: 2,
             task_padding: 6,
@@ -254,6 +256,15 @@ mod tests {
     fn rejects_unknown_keys() {
         let error = toml::from_str::<Config>("unknown = true").unwrap_err();
         assert!(error.to_string().contains("unknown"));
+    }
+
+    #[test]
+    fn task_visibility_can_be_disabled() {
+        let config = toml::from_str::<Config>("show_tasks = false").unwrap();
+        config.validate().unwrap();
+        assert!(!config.show_tasks);
+        assert!(toml::from_str::<Config>("").unwrap().show_tasks);
+        assert!(toml::from_str::<Config>(DEFAULT_CONFIG).unwrap().show_tasks);
     }
 
     #[test]

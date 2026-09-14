@@ -45,7 +45,24 @@ nibari --config /path/to/config.toml
 `"%d.%m.%Y %H:%M:%S"` will show the date and time with seconds. Other available
 parameters are listed in [`config.example.toml`](config.example.toml).
 
-The appearance of the central tasklist is configured via `task_*` parameters.
+To make the background transparent and hide the central list of open windows:
+
+```toml
+background = "#28282800"
+show_tasks = false
+```
+
+Colors accept `#RRGGBB` (opaque) or `#RRGGBBAA`, where the last two hexadecimal
+digits control opacity: `00` is fully transparent, `80` is approximately 50%,
+and `FF` is fully opaque. For example, `background = "#28282880"` gives a
+semi-transparent background while keeping text and icons at their configured opacity.
+Workspace highlights and task buttons have their own background colors; set their
+`*_background` colors to an alpha of `00` too if you want those transparent.
+Restart nibari after editing the config.
+
+The central tasklist is shown by default (`show_tasks = true`); its appearance
+is configured via `task_*` parameters. Hiding it keeps workspaces, the keyboard
+layout, tray, and clock visible and skips application icon and title preparation.
 The icon is searched for first via the application's desktop file, then in the selected icon
 theme; if it is missing, a stable colored placeholder is drawn.
 

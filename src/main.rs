@@ -3,11 +3,14 @@ mod config;
 mod control;
 mod icons;
 mod logger;
+mod media;
 mod memory;
+mod network;
 mod niri;
 mod render;
 mod single_instance;
 mod tray;
+mod weather;
 
 fn main() -> anyhow::Result<()> {
     logger::init();

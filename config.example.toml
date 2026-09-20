@@ -15,6 +15,12 @@ padding = 8
 tray_icon_size = 18
 tray_spacing = 6
 
+# Прятать трей за стрелкой и раскрывать при наведении.
+# Остаётся открытым над иконками, промежутками и меню трея.
+tray_drawer = false
+# Длительность раскрытия/сворачивания в миллисекундах; 0 — без анимации.
+tray_drawer_duration_ms = 600
+
 # По 5 workspaces слева: 一–五 на первом output, 六–零 на втором.
 workspace_width = 28
 workspace_focused_background = "#3C3836"
@@ -24,9 +30,12 @@ workspace_occupied_foreground = "#DCDCCC"
 workspace_empty_foreground = "#6F6F6F"
 workspace_urgent_foreground = "#CC9393"
 
-# Окна активного workspace в центре.
+# Текущее медиа через MPRIS: иконка приложения, трек, позиция и статус.
+media_enabled = true
+
+# Окна активного workspace между workspaces и центральными часами.
 # false — скрыть список окон, сохранив workspaces, раскладку, трей и часы.
-show_tasks = true
+show_tasks = false
 task_icon_size = 18
 task_spacing = 2
 task_padding = 6
@@ -36,8 +45,53 @@ task_urgent_background = "#282828"
 task_foreground = "#DCDCCC"
 task_focused_foreground = "#F0DFAF"
 
+# Погода справа от даты/времени; карточка по нажатию.
+weather_enabled = false
+# Пустая строка — автоматический город по внешнему IP (учитывает VPN).
+# Либо название города, например "Helsinki" или "Уфа".
+weather_location = ""
+# Точные координаты имеют приоритет над поиском города; задаются только парой.
+# weather_latitude = 60.1695
+# weather_longitude = 24.9354
+# "metric" — °C и km/h; "imperial" — °F и mph.
+weather_units = "metric"
+# Интервал фонового обновления, 5..1440 минут.
+weather_refresh_minutes = 15
+weather_background = "#282828F2"
+weather_foreground = "#DCDCCC"
+weather_muted = "#6F6F6F"
+weather_accent = "#F0DFAF"
+weather_border = "#6F6F6F"
+
+# Значок сети справа от раскладки; карточка статистики по нажатию.
+network_enabled = false
+# Пустая строка — интерфейс маршрута по умолчанию; либо имя, например "eth0".
+network_interface = ""
+# Числовой IP для ping. Опрос трафика и ping работают только при открытой карточке.
+network_ping_target = "1.1.1.1"
+network_background = "#282828F2"
+network_foreground = "#DCDCCC"
+network_muted = "#6F6F6F"
+network_accent = "#F0DFAF"
+network_border = "#6F6F6F"
+
 # Формат chrono/strftime.
 clock_format = "%a %b %d, %H:%M"
+
+# Весь блок даты и времени: "right" или строго по центру бара — "center".
+clock_position = "right"
+
+# Календарь по нажатию на дату/время. Цвета поддерживают #RRGGBBAA.
+calendar_enabled = true
+calendar_background = "#282828F2"
+calendar_foreground = "#DCDCCC"
+calendar_header = "#F0DFAF"
+calendar_weekday = "#DCDCCC"
+calendar_weekend = "#CC9393"
+calendar_muted = "#6F6F6F"
+calendar_today_background = "#3C3836"
+calendar_today_foreground = "#F0DFAF"
+calendar_border = "#6F6F6F"
 
 # Если не задано, nibari попробует использовать текущую GTK icon theme,
 # затем hicolor.

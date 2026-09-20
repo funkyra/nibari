@@ -266,6 +266,7 @@ fn listen_forever(events: UiSender<NiriEvent>, config: Config) {
         .then(|| ApplicationIconCache::new(&config));
     loop {
         if let Err(error) = listen(&events, icons.as_mut()) {
+            let _ = events.send(NiriEvent::State(Arc::new(NiriModel::default())));
             log::warn!("niri IPC: {error}; reconnecting");
             thread::sleep(Duration::from_secs(2));
         }
@@ -575,6 +576,47 @@ fn is_open_icon_key(key: &str, window_ids: &HashSet<u64>, app_ids: &HashSet<&str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tasks_follow_the_active_workspace_instead_of_all_running_applications() {
+        let mut state = EventStreamState::default();
+        let _ = state.apply(Event::WorkspacesChanged {
+            workspaces: (1..=2)
+                .map(|idx| niri_ipc::Workspace {
+                    id: 100 + u64::from(idx),
+                    idx,
+                    name: None,
+                    output: Some("DP-1".into()),
+                    is_urgent: false,
+                    is_active: idx == 1,
+                    is_focused: idx == 1,
+                    active_window_id: Some(u64::from(idx)),
+                })
+                .collect(),
+        });
+        let mut first = sample_window(1);
+        first.workspace_id = Some(101);
+        let mut second = sample_window(2);
+        second.workspace_id = Some(102);
+        let _ = state.apply(Event::WindowsChanged {
+            windows: vec![first, second],
+        });
+        let mut icons = ApplicationIconCache::new(&Config::default());
+        let first = niri_model(&state, Some(&mut icons)).surface_content(Some("DP-1"), 0);
+        assert_eq!(
+            first.tasks.iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec![1]
+        );
+        let _ = state.apply(Event::WorkspaceActivated {
+            id: 102,
+            focused: true,
+        });
+        let second = niri_model(&state, Some(&mut icons)).surface_content(Some("DP-1"), 0);
+        assert_eq!(
+            second.tasks.iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
     use super::*;
 
     fn sample_window(id: u64) -> niri_ipc::Window {

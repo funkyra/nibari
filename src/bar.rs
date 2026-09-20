@@ -54,16 +54,22 @@ use wayland_client::{
 
 use crate::{
     config::Config,
+    media::{MediaHandle, MediaSnapshot},
     memory::{self, TrimSchedule},
+    network::{NetworkHandle, NetworkOptions, NetworkSnapshot},
     niri::{
         self, FocusCommand, NiriEvent, NiriHandle, NiriModel, SurfaceContent,
         WORKSPACES_PER_OUTPUT, WindowTask, WorkspaceSlot,
     },
     render::{
-        HitTarget, Hitbox, MenuHitbox, MenuSelection, PreparedMenu, RenderContent, Renderer,
+        HitTarget, Hitbox, MenuHitbox, MenuSelection, PreparedPopup, RenderContent, Renderer,
+        calendar::{CalendarPalette, shifted_month},
         hit_target_at,
+        network::NetworkPalette,
+        weather::WeatherPalette,
     },
     tray::{TrayEvent, TrayHandle, TrayIcon, TrayMenuEntry, TrayMenuPopup},
+    weather::{Condition, WeatherHandle, WeatherOptions, WeatherState},
 };
 
 const BTN_LEFT: u32 = 0x110;
@@ -106,11 +112,53 @@ pub fn run(config: Config) -> Result<()> {
 
     let (tray_events, tray_channel) = channel::channel();
     let tray = TrayHandle::spawn(tray_events, &config);
+    let (media_events, media_channel) = channel::channel();
+    let media = config
+        .media_enabled
+        .then(|| MediaHandle::spawn(media_events, &config));
     let (niri_events, niri_channel) = channel::channel();
     let niri = niri::spawn(niri_events, &config);
     let clock_granularity = clock_granularity(&config.clock_format);
     let renderer = Renderer::new(&config);
     let background_opaque = config.background_rgba()[3] == 255;
+    let calendar_palette = CalendarPalette::from(&config);
+    let weather_palette = WeatherPalette::from(&config);
+    let (weather_events, weather_channel) = channel::channel();
+    let weather = if config.weather_enabled {
+        match WeatherHandle::spawn(weather_events, WeatherOptions::from(&config)) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                log::warn!("failed to start weather: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let network_palette = NetworkPalette::from(&config);
+    let network_target = config
+        .network_ping_target
+        .parse()
+        .expect("validated network target");
+    let (network_events, network_channel) = channel::channel();
+    let network = if config.network_enabled {
+        match NetworkHandle::spawn(
+            network_events,
+            NetworkOptions {
+                interface: (!config.network_interface.is_empty())
+                    .then(|| config.network_interface.clone()),
+                ping_target: network_target,
+            },
+        ) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                log::warn!("failed to start network monitoring: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -124,6 +172,15 @@ pub fn run(config: Config) -> Result<()> {
         loop_handle: event_loop.handle(),
         trim_schedule: TrimSchedule::default(),
         config,
+        calendar_palette,
+        weather_palette,
+        weather,
+        weather_state: Arc::new(WeatherState::default()),
+        network_palette,
+        network_target,
+        network,
+        network_snapshot: NetworkSnapshot::default(),
+        network_visible: false,
         renderer,
         background_opaque,
         bars_hidden: false,
@@ -139,9 +196,58 @@ pub fn run(config: Config) -> Result<()> {
         niri_model: Arc::new(NiriModel::default()),
         niri,
         tray,
+        media,
+        media_snapshot: None,
     };
     app.update_clock();
     app.schedule_memory_trim();
+
+    if app.weather.is_some() {
+        event_loop
+            .handle()
+            .insert_source(weather_channel, |event, _, app| {
+                if let ChannelEvent::Msg(state) = event {
+                    let (condition, night) = state
+                        .report
+                        .as_ref()
+                        .map_or((Condition::Unknown, false), |r| (r.condition, r.night));
+                    if app.renderer.set_weather_condition(condition, night) {
+                        app.mark_bars_dirty();
+                    }
+                    app.weather_state = state;
+                    app.update_weather_popup();
+                }
+            })
+            .map_err(|error| anyhow::anyhow!("failed to attach weather events: {error}"))?;
+    }
+    if app.network.is_some() {
+        event_loop
+            .handle()
+            .insert_source(network_channel, |event, _, app| {
+                if let ChannelEvent::Msg(snapshot) = event {
+                    if app.renderer.set_network_kind(snapshot.kind) {
+                        app.mark_bars_dirty();
+                    }
+                    app.network_snapshot = snapshot;
+                    app.update_network_popup();
+                }
+            })
+            .map_err(|error| anyhow::anyhow!("failed to attach network events: {error}"))?;
+    }
+
+    if app.media.is_some() {
+        event_loop
+            .handle()
+            .insert_source(media_channel, |event, _, app| {
+                if let ChannelEvent::Msg(snapshot) = event {
+                    if app.media_snapshot != snapshot {
+                        app.media_snapshot = snapshot;
+                        app.mark_bars_dirty();
+                    }
+                }
+            })
+            .map_err(|error| anyhow::anyhow!("failed to attach media events: {error}"))?;
+    }
 
     event_loop
         .handle()
@@ -150,11 +256,10 @@ pub fn run(config: Config) -> Result<()> {
                 match event {
                     TrayEvent::Items(items) if app.tray_icons != items => {
                         app.renderer.retain_tray_icons(&items);
-                        if app
-                            .menu_surface
-                            .as_ref()
-                            .is_some_and(|menu| !items.iter().any(|icon| icon.id == menu.address))
-                        {
+                        if app.menu_surface.as_ref().is_some_and(|menu| {
+                            menu.prepared.is_tray()
+                                && !items.iter().any(|icon| icon.id == menu.address)
+                        }) {
                             app.menu_surface = None;
                         }
                         app.tray_icons = items;
@@ -202,6 +307,52 @@ pub fn run(config: Config) -> Result<()> {
     }
 }
 
+/// Per-output state. Frame callbacks drive transitions; settled drawers need no wakeups.
+#[derive(Default)]
+struct TrayDrawer {
+    progress: f32,
+    from: f32,
+    expanded: bool,
+    started: Option<Instant>,
+}
+
+impl TrayDrawer {
+    fn is_animating(&self) -> bool {
+        self.started.is_some()
+    }
+
+    fn update(&mut self, hovered: bool, menu_open: bool, now: Instant, duration: Duration) -> bool {
+        let expanded = hovered || menu_open;
+        let previous = self.progress;
+        if let Some(started) = self.started {
+            let fraction = if duration.is_zero() {
+                1.0
+            } else {
+                (now.saturating_duration_since(started).as_secs_f32() / duration.as_secs_f32())
+                    .min(1.0)
+            };
+            let eased = fraction * fraction * (3.0 - 2.0 * fraction);
+            let target = if self.expanded { 1.0 } else { 0.0 };
+            self.progress = self.from + (target - self.from) * eased;
+            if fraction >= 1.0 {
+                self.progress = target;
+                self.started = None;
+            }
+        }
+        if self.expanded != expanded {
+            self.expanded = expanded;
+            self.from = self.progress;
+            let target = if expanded { 1.0 } else { 0.0 };
+            self.started = (self.progress != target).then_some(now);
+        }
+        if duration.is_zero() {
+            self.progress = if expanded { 1.0 } else { 0.0 };
+            self.started = None;
+        }
+        previous != self.progress || self.is_animating()
+    }
+}
+
 struct BarSurface {
     layer: LayerSurface,
     pool: SlotPool,
@@ -218,6 +369,8 @@ struct BarSurface {
     dirty: bool,
     frame_pending: bool,
     hitboxes: Vec<Hitbox>,
+    tray_drawer: TrayDrawer,
+    pointer_position: Option<(f64, f64)>,
     buffers: Vec<ShmBuffer>,
     format: wl_shm::Format,
 }
@@ -232,7 +385,8 @@ struct MenuSurface {
     entries: Vec<TrayMenuEntry>,
     pages: Vec<MenuPage>,
     title: Option<String>,
-    prepared: PreparedMenu,
+    prepared: PreparedPopup,
+    calendar_scroll: f64,
     selected: Option<MenuSelection>,
     anchor_x: i32,
     output_width: u32,
@@ -274,6 +428,15 @@ struct App {
     loop_handle: LoopHandle<'static, Self>,
     trim_schedule: TrimSchedule,
     config: Config,
+    calendar_palette: CalendarPalette,
+    weather_palette: WeatherPalette,
+    weather: Option<WeatherHandle>,
+    weather_state: Arc<WeatherState>,
+    network_palette: NetworkPalette,
+    network_target: std::net::IpAddr,
+    network: Option<NetworkHandle>,
+    network_snapshot: NetworkSnapshot,
+    network_visible: bool,
     renderer: Renderer,
     background_opaque: bool,
     bars_hidden: bool,
@@ -289,6 +452,8 @@ struct App {
     niri_model: Arc<NiriModel>,
     niri: NiriHandle,
     tray: TrayHandle,
+    media: Option<MediaHandle>,
+    media_snapshot: Option<Arc<MediaSnapshot>>,
 }
 
 #[derive(Clone, Copy)]
@@ -300,8 +465,10 @@ struct FrameSpec<'a> {
     clock: &'a str,
     keyboard_layout: &'a str,
     tray_icons: &'a [TrayIcon],
+    tray_reveal: f32,
     workspaces: &'a [WorkspaceSlot; WORKSPACES_PER_OUTPUT],
     tasks: &'a [WindowTask],
+    media: Option<&'a MediaSnapshot>,
 }
 
 #[derive(Clone, Copy)]
@@ -425,6 +592,8 @@ impl App {
             dirty: true,
             frame_pending: false,
             hitboxes: Vec::new(),
+            tray_drawer: TrayDrawer::default(),
+            pointer_position: None,
             buffers: Vec::with_capacity(2),
             format: wl_shm::Format::Argb8888,
         });
@@ -498,10 +667,19 @@ impl App {
     }
 
     fn update_clock(&mut self) {
-        let clock = Local::now().format(&self.config.clock_format).to_string();
+        let now = Local::now();
+        let clock = now.format(&self.config.clock_format).to_string();
         if clock != self.clock {
             self.clock = clock;
             self.mark_bars_dirty();
+        }
+        if self
+            .menu_surface
+            .as_ref()
+            .and_then(|m| m.prepared.calendar_dates())
+            .is_some_and(|(_, today)| today != now.date_naive())
+        {
+            self.update_menu_page();
         }
     }
 
@@ -517,6 +695,16 @@ impl App {
     }
 
     fn draw_dirty(&mut self) -> Result<()> {
+        let network_visible = self
+            .menu_surface
+            .as_ref()
+            .is_some_and(|menu| menu.prepared.is_network());
+        if self.network_visible != network_visible {
+            self.network_visible = network_visible;
+            if let Some(network) = &self.network {
+                network.set_visible(network_visible);
+            }
+        }
         let menu_open = self.menu_surface.is_some();
         if self.menu_was_open != menu_open {
             self.menu_was_open = menu_open;
@@ -536,9 +724,34 @@ impl App {
         if old_count != self.keyboards.len() {
             self.schedule_memory_trim();
         }
+        if self.config.tray_drawer {
+            let now = Instant::now();
+            let duration = Duration::from_millis(u64::from(self.config.tray_drawer_duration_ms));
+            for surface in &mut self.surfaces {
+                let hovered = surface.pointer_position.is_some_and(|(x, y)| {
+                    matches!(
+                        hit_target_at(&surface.hitboxes, surface.scale, x, y),
+                        Some(HitTarget::TrayDrawer | HitTarget::Tray(_))
+                    )
+                });
+                let menu_open = self
+                    .menu_surface
+                    .as_ref()
+                    .is_some_and(|menu| menu.prepared.is_tray() && menu.parent == surface.layer);
+                if self.tray_icons.is_empty() {
+                    surface.tray_drawer = TrayDrawer::default();
+                } else if surface
+                    .tray_drawer
+                    .update(hovered, menu_open, now, duration)
+                {
+                    surface.dirty = true;
+                }
+            }
+        }
         let queue_handle = &self.queue_handle;
         let clock = &self.clock;
         let tray_icons = &self.tray_icons;
+        let media_snapshot = self.media_snapshot.as_deref();
         let renderer = &mut self.renderer;
         let format = preferred_shm_format(self.shm.formats());
 
@@ -550,7 +763,14 @@ impl App {
                     surface.format = format;
                     surface.buffers.clear();
                 }
-                draw_surface(surface, renderer, clock, tray_icons, queue_handle)
+                draw_surface(
+                    surface,
+                    renderer,
+                    clock,
+                    tray_icons,
+                    media_snapshot,
+                    queue_handle,
+                )
             })?;
 
         if let Some(menu) = self.menu_surface.as_mut()
@@ -588,7 +808,142 @@ impl App {
             .pending_menu_grab
             .take()
             .expect("validated tray menu grab remains available");
-        let mut prepared = self.renderer.prepare_menu(&menu.items, target.scale, None);
+        let prepared =
+            PreparedPopup::Tray(self.renderer.prepare_menu(&menu.items, target.scale, None));
+        self.show_popup(target, seat, serial, prepared, Some(menu));
+    }
+
+    fn show_weather(&mut self, x: i32, y: i32) {
+        if !self.config.weather_enabled {
+            return;
+        }
+        let Some(target) = self.menu_target(x, y) else {
+            return;
+        };
+        let Some((seat, serial, _, _)) = self.pending_menu_grab.take() else {
+            return;
+        };
+        let prepared = PreparedPopup::Weather(self.renderer.prepare_weather(
+            &self.weather_state,
+            self.config.weather_units,
+            target.scale,
+            &self.weather_palette,
+        ));
+        self.show_popup(target, seat, serial, prepared, None);
+        if let Some(weather) = &self.weather {
+            weather.refresh();
+        }
+    }
+
+    fn update_weather_popup(&mut self) {
+        let Some(menu) = self
+            .menu_surface
+            .as_mut()
+            .filter(|m| m.prepared.is_weather())
+        else {
+            return;
+        };
+        let mut prepared = PreparedPopup::Weather(self.renderer.prepare_weather(
+            &self.weather_state,
+            self.config.weather_units,
+            menu.scale,
+            &self.weather_palette,
+        ));
+        constrain_menu(
+            &mut prepared,
+            menu.scale,
+            menu.output_width,
+            menu.output_height.saturating_sub(self.config.height),
+        );
+        let (w, h) = prepared.size();
+        if (w.div_ceil(menu.scale), h.div_ceil(menu.scale))
+            != (menu.logical_width, menu.logical_height)
+        {
+            self.update_menu_page();
+            return;
+        }
+        menu.prepared = prepared;
+        menu.dirty = true;
+    }
+
+    fn show_network(&mut self, x: i32, y: i32) {
+        if !self.config.network_enabled {
+            return;
+        }
+        let Some(target) = self.menu_target(x, y) else {
+            return;
+        };
+        let Some((seat, serial, _, _)) = self.pending_menu_grab.take() else {
+            return;
+        };
+        let prepared = PreparedPopup::Network(self.renderer.prepare_network(
+            &self.network_snapshot,
+            self.network_target,
+            target.scale,
+            &self.network_palette,
+        ));
+        self.show_popup(target, seat, serial, prepared, None);
+    }
+
+    fn update_network_popup(&mut self) {
+        let Some(menu) = self
+            .menu_surface
+            .as_mut()
+            .filter(|m| m.prepared.is_network())
+        else {
+            return;
+        };
+        let mut prepared = PreparedPopup::Network(self.renderer.prepare_network(
+            &self.network_snapshot,
+            self.network_target,
+            menu.scale,
+            &self.network_palette,
+        ));
+        constrain_menu(
+            &mut prepared,
+            menu.scale,
+            menu.output_width,
+            menu.output_height.saturating_sub(self.config.height),
+        );
+        let (w, h) = prepared.size();
+        if (w.div_ceil(menu.scale), h.div_ceil(menu.scale))
+            != (menu.logical_width, menu.logical_height)
+        {
+            self.update_menu_page();
+            return;
+        }
+        menu.prepared = prepared;
+        menu.dirty = true;
+    }
+
+    fn show_calendar(&mut self, x: i32, y: i32) {
+        if !self.config.calendar_enabled {
+            return;
+        }
+        let Some(target) = self.menu_target(x, y) else {
+            return;
+        };
+        let Some((seat, serial, _, _)) = self.pending_menu_grab.take() else {
+            return;
+        };
+        let today = Local::now().date_naive();
+        let prepared = PreparedPopup::Calendar(self.renderer.prepare_calendar(
+            today,
+            today,
+            target.scale,
+            &self.calendar_palette,
+        ));
+        self.show_popup(target, seat, serial, prepared, None);
+    }
+
+    fn show_popup(
+        &mut self,
+        target: MenuTarget,
+        seat: wl_seat::WlSeat,
+        serial: u32,
+        mut prepared: PreparedPopup,
+        menu: Option<TrayMenuPopup>,
+    ) {
         constrain_menu(
             &mut prepared,
             target.scale,
@@ -600,10 +955,12 @@ impl App {
             bounded_dimension(buffer_width.div_ceil(target.scale), target.logical_width);
         let logical_height =
             bounded_dimension(buffer_height.div_ceil(target.scale), target.logical_height);
-        let left = target
-            .local_x
-            .max(0)
-            .min(target.logical_width.saturating_sub(logical_width) as i32);
+        let left = popup_left(
+            target.local_x,
+            logical_width,
+            target.logical_width,
+            prepared.centered(),
+        );
         let top = menu_top(self.config.height, logical_height, target.logical_height);
 
         self.menu_surface = None;
@@ -659,17 +1016,21 @@ impl App {
         popup.wl_surface().set_buffer_scale(target.scale as i32);
         popup.wl_surface().commit();
 
+        let (address, menu_path, entries) = menu
+            .map(|m| (m.address, m.menu_path, m.items))
+            .unwrap_or_default();
         self.menu_surface = Some(MenuSurface {
             seat,
             popup,
             parent: target.parent,
             pool,
-            address: menu.address,
-            menu_path: menu.menu_path,
-            entries: menu.items,
+            address,
+            menu_path,
+            entries,
             pages: Vec::new(),
             title: None,
             prepared,
+            calendar_scroll: 0.0,
             selected: None,
             anchor_x: target.local_x,
             output_width: target.logical_width,
@@ -725,9 +1086,34 @@ impl App {
         let Some(menu) = self.menu_surface.as_mut() else {
             return;
         };
-        menu.prepared =
-            self.renderer
-                .prepare_menu(&menu.entries, menu.scale, menu.title.as_deref());
+        menu.prepared = if menu.prepared.is_weather() {
+            PreparedPopup::Weather(self.renderer.prepare_weather(
+                &self.weather_state,
+                self.config.weather_units,
+                menu.scale,
+                &self.weather_palette,
+            ))
+        } else if menu.prepared.is_network() {
+            PreparedPopup::Network(self.renderer.prepare_network(
+                &self.network_snapshot,
+                self.network_target,
+                menu.scale,
+                &self.network_palette,
+            ))
+        } else if let Some((month, _)) = menu.prepared.calendar_dates() {
+            PreparedPopup::Calendar(self.renderer.prepare_calendar(
+                month,
+                Local::now().date_naive(),
+                menu.scale,
+                &self.calendar_palette,
+            ))
+        } else {
+            PreparedPopup::Tray(self.renderer.prepare_menu(
+                &menu.entries,
+                menu.scale,
+                menu.title.as_deref(),
+            ))
+        };
         constrain_menu(
             &mut menu.prepared,
             menu.scale,
@@ -738,10 +1124,12 @@ impl App {
         let logical_width = bounded_dimension(buffer_width.div_ceil(menu.scale), menu.output_width);
         let logical_height =
             bounded_dimension(buffer_height.div_ceil(menu.scale), menu.output_height);
-        let left = menu
-            .anchor_x
-            .max(0)
-            .min(menu.output_width.saturating_sub(logical_width) as i32);
+        let left = popup_left(
+            menu.anchor_x,
+            logical_width,
+            menu.output_width,
+            menu.prepared.centered(),
+        );
         let top = menu_top(self.config.height, logical_height, menu.output_height);
 
         menu.logical_width = logical_width;
@@ -757,6 +1145,25 @@ impl App {
             }
             Err(error) => log::warn!("failed to reposition tray menu: {error}"),
         }
+    }
+
+    fn navigate_calendar(&mut self, direction: i32) {
+        let Some(menu) = self.menu_surface.as_mut() else {
+            return;
+        };
+        let PreparedPopup::Calendar(calendar) = &mut menu.prepared else {
+            return;
+        };
+        let next = if direction == 0 {
+            Local::now().date_naive()
+        } else {
+            shifted_month(calendar.month, direction)
+        };
+        if next == calendar.month {
+            return;
+        }
+        calendar.month = next;
+        self.update_menu_page();
     }
 
     fn go_back_menu(&mut self) {
@@ -794,9 +1201,55 @@ impl App {
     }
 
     fn apply_menu_action(&mut self, action: MenuInputAction) {
+        if self
+            .menu_surface
+            .as_ref()
+            .is_some_and(|menu| menu.prepared.is_weather())
+        {
+            match action {
+                MenuInputAction::Activate(0) => {
+                    if let Some(weather) = &self.weather {
+                        weather.refresh();
+                    }
+                }
+                MenuInputAction::Dismiss => self.menu_surface = None,
+                _ => {}
+            }
+            return;
+        }
+        if self
+            .menu_surface
+            .as_ref()
+            .is_some_and(|menu| menu.prepared.is_network())
+        {
+            match action {
+                MenuInputAction::Activate(0) => {
+                    if let Some(network) = &self.network {
+                        network.refresh();
+                    }
+                }
+                MenuInputAction::Dismiss => self.menu_surface = None,
+                _ => {}
+            }
+            return;
+        }
+        if self
+            .menu_surface
+            .as_ref()
+            .is_some_and(|m| m.prepared.calendar_dates().is_some())
+        {
+            match action {
+                MenuInputAction::Activate(id) => self.navigate_calendar(id),
+                MenuInputAction::Dismiss => self.menu_surface = None,
+                _ => {}
+            }
+            return;
+        }
         match action {
             MenuInputAction::None => {}
-            MenuInputAction::Dismiss => self.menu_surface = None,
+            MenuInputAction::Dismiss => {
+                self.menu_surface = None;
+            }
             MenuInputAction::Back => self.go_back_menu(),
             MenuInputAction::OpenSubmenu(item_id) => self.open_submenu(item_id),
             MenuInputAction::Activate(item_id) => {
@@ -816,11 +1269,29 @@ impl App {
         let Some(menu) = self.menu_surface.as_mut() else {
             return;
         };
+        if menu.prepared.calendar_dates().is_some() {
+            match keysym {
+                Keysym::Left | Keysym::Page_Up => {
+                    self.navigate_calendar(-1);
+                    return;
+                }
+                Keysym::Right | Keysym::Page_Down => {
+                    self.navigate_calendar(1);
+                    return;
+                }
+                Keysym::Home => {
+                    self.navigate_calendar(0);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match keysym {
-            Keysym::Up | Keysym::Down => {
-                let selected = menu
-                    .prepared
-                    .next_selection(menu.selected, keysym == Keysym::Up);
+            Keysym::Up | Keysym::Down | Keysym::Tab | Keysym::ISO_Left_Tab => {
+                let selected = menu.prepared.next_selection(
+                    menu.selected,
+                    matches!(keysym, Keysym::Up | Keysym::ISO_Left_Tab),
+                );
                 if menu.selected != selected {
                     menu.selected = selected;
                     menu.dirty = true;
@@ -895,6 +1366,37 @@ impl App {
 
         self.menu_surface = None;
         match hit_target_at(&bar.hitboxes, bar.scale, x, y) {
+            Some(HitTarget::Weather) if button == BTN_LEFT => {
+                let icon = bar
+                    .hitboxes
+                    .iter()
+                    .find(|hit| hit.target == HitTarget::Weather)
+                    .expect("weather hitbox exists");
+                let global_x = bar.output_position.0 + (icon.x + icon.width / 2) / bar.scale as i32;
+                let global_y = bar.output_position.1 + y.round() as i32;
+                self.show_weather(global_x, global_y);
+            }
+            Some(HitTarget::Network) if button == BTN_LEFT => {
+                let icon = bar
+                    .hitboxes
+                    .iter()
+                    .find(|hit| hit.target == HitTarget::Network)
+                    .expect("network hitbox exists");
+                let global_x = bar.output_position.0 + (icon.x + icon.width / 2) / bar.scale as i32;
+                let global_y = bar.output_position.1 + y.round() as i32;
+                self.show_network(global_x, global_y);
+            }
+            Some(HitTarget::Clock) if button == BTN_LEFT => {
+                let clock = bar
+                    .hitboxes
+                    .iter()
+                    .find(|hit| hit.target == HitTarget::Clock)
+                    .expect("clock hitbox exists");
+                let global_x =
+                    bar.output_position.0 + (clock.x + clock.width / 2) / bar.scale as i32;
+                let global_y = bar.output_position.1 + y.round() as i32;
+                self.show_calendar(global_x, global_y);
+            }
             Some(HitTarget::Workspace { id, index }) if button == BTN_LEFT => {
                 self.niri.focus(FocusCommand::Workspace {
                     id,
@@ -953,6 +1455,15 @@ fn menu_input_action(
     }
 }
 
+fn popup_left(anchor: i32, width: u32, output_width: u32, centered: bool) -> i32 {
+    let left = if centered {
+        anchor - width as i32 / 2
+    } else {
+        anchor
+    };
+    left.clamp(0, output_width.saturating_sub(width) as i32)
+}
+
 fn bounded_dimension(preferred: u32, output_bound: u32) -> u32 {
     if output_bound == 0 {
         preferred.max(1)
@@ -961,7 +1472,7 @@ fn bounded_dimension(preferred: u32, output_bound: u32) -> u32 {
     }
 }
 
-fn constrain_menu(menu: &mut PreparedMenu, scale: u32, logical_width: u32, logical_height: u32) {
+fn constrain_menu(menu: &mut PreparedPopup, scale: u32, logical_width: u32, logical_height: u32) {
     if logical_width > 0 && logical_height > 0 {
         menu.constrain(
             logical_width.saturating_mul(scale),
@@ -1021,6 +1532,7 @@ fn draw_surface(
     renderer: &mut Renderer,
     clock: &str,
     tray_icons: &[TrayIcon],
+    media: Option<&MediaSnapshot>,
     queue_handle: &QueueHandle<App>,
 ) -> Result<()> {
     let width = surface
@@ -1045,8 +1557,10 @@ fn draw_surface(
         clock,
         keyboard_layout: content.keyboard_layout.as_ref(),
         tray_icons,
+        tray_reveal: surface.tray_drawer.progress,
         workspaces: &content.workspaces,
         tasks: content.tasks.as_ref(),
+        media,
     };
     let wayland_surface = surface.layer.wl_surface();
     let mut reusable = None;
@@ -1175,8 +1689,10 @@ fn render_canvas(
             clock: frame.clock,
             keyboard_layout: frame.keyboard_layout,
             tray: frame.tray_icons,
+            tray_reveal: frame.tray_reveal,
             workspaces: frame.workspaces,
             tasks: frame.tasks,
+            media: frame.media,
         },
         hitboxes,
     );
@@ -1189,13 +1705,13 @@ fn render_menu_canvas(
     canvas: &mut [u8],
     renderer: &mut Renderer,
     hitboxes: &mut Vec<MenuHitbox>,
-    menu: &PreparedMenu,
+    menu: &PreparedPopup,
     selected: Option<MenuSelection>,
     frame: MenuFrame,
 ) -> Result<()> {
     let mut pixmap = PixmapMut::from_bytes(canvas, frame.width, frame.height)
         .context("invalid menu pixmap size")?;
-    renderer.draw_menu(&mut pixmap, menu, hitboxes, selected);
+    renderer.draw_popup(&mut pixmap, menu, hitboxes, selected);
     convert_canvas_for_wayland(&mut pixmap, frame.format);
     Ok(())
 }
@@ -1655,6 +2171,20 @@ impl PointerHandler for App {
                 .menu_surface
                 .as_ref()
                 .is_some_and(|menu| menu.popup.wl_surface() == &event.surface);
+            if self.config.tray_drawer
+                && let Some(bar) = self
+                    .surfaces
+                    .iter_mut()
+                    .find(|bar| bar.layer.wl_surface() == &event.surface)
+            {
+                match event.kind {
+                    PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                        bar.pointer_position = Some(event.position);
+                    }
+                    PointerEventKind::Leave { .. } => bar.pointer_position = None,
+                    _ => {}
+                }
+            }
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } if is_menu => {
                     if let Some(menu) = self.menu_surface.as_mut() {
@@ -1676,6 +2206,22 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Axis { vertical, .. } if is_menu => {
                     if let Some(menu) = self.menu_surface.as_mut() {
+                        if menu.prepared.calendar_dates().is_some() {
+                            let delta = if vertical.value120 != 0 {
+                                f64::from(vertical.value120) / 120.0
+                            } else if vertical.discrete != 0 {
+                                f64::from(vertical.discrete)
+                            } else {
+                                vertical.absolute / 32.0
+                            };
+                            menu.calendar_scroll += delta;
+                            let months = menu.calendar_scroll.trunc() as i32;
+                            menu.calendar_scroll -= f64::from(months);
+                            if months != 0 {
+                                self.navigate_calendar(months);
+                            }
+                            continue;
+                        }
                         let logical_delta = if vertical.absolute != 0.0 {
                             vertical.absolute
                         } else if vertical.value120 != 0 {
@@ -1695,7 +2241,7 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Press { button, serial, .. } => {
                     self.pending_menu_grab = None;
-                    if button == BTN_RIGHT
+                    if (button == BTN_RIGHT || button == BTN_LEFT)
                         && self
                             .surfaces
                             .iter()
@@ -1765,6 +2311,68 @@ fn preferred_shm_format(formats: &[wl_shm::Format]) -> wl_shm::Format {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn calendar_popup_is_centered_under_clock_and_clamped_to_output() {
+        assert_eq!(popup_left(960, 288, 1920, true), 816);
+        assert_eq!(popup_left(20, 288, 1920, true), 0);
+        assert_eq!(popup_left(1900, 288, 1920, true), 1632);
+        assert_eq!(popup_left(960, 288, 1920, false), 960);
+        assert_eq!(popup_left(100, 288, 200, true), 0);
+    }
+
+    #[test]
+    fn tray_drawer_does_not_animate_when_already_at_target() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(600);
+        let mut drawer = TrayDrawer::default();
+        assert!(drawer.update(true, false, now, duration));
+        assert!(!drawer.update(false, false, now, duration));
+        assert!(!drawer.is_animating());
+        assert!(!drawer.update(false, false, now + duration / 2, duration));
+    }
+
+    #[test]
+    fn tray_drawer_stays_open_for_menu_until_dismissed() {
+        let now = Instant::now();
+        let mut drawer = TrayDrawer::default();
+        drawer.update(true, false, now, Duration::ZERO);
+        assert!(!drawer.update(false, true, now, Duration::ZERO));
+        assert_eq!(drawer.progress, 1.0);
+        assert!(!drawer.update(true, false, now, Duration::ZERO));
+        assert!(drawer.update(false, false, now, Duration::ZERO));
+        assert_eq!(drawer.progress, 0.0);
+    }
+
+    #[test]
+    fn tray_drawer_animates_reverses_and_stops() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(600);
+        let mut drawer = TrayDrawer::default();
+        assert!(!drawer.update(false, false, now, duration));
+        assert!(drawer.update(true, false, now, duration));
+        assert_eq!(drawer.progress, 0.0);
+        assert!(drawer.update(true, false, now + duration / 2, duration));
+        assert!((drawer.progress - 0.5).abs() < 0.001);
+        let halfway = drawer.progress;
+        drawer.update(false, false, now + duration / 2, duration);
+        assert_eq!(drawer.progress, halfway, "reversing should not jump");
+        drawer.update(false, false, now + duration * 2, duration);
+        assert_eq!(drawer.progress, 0.0);
+        assert!(!drawer.update(false, false, now + duration * 3, duration));
+        assert!(!drawer.is_animating());
+    }
+
+    #[test]
+    fn tray_drawer_zero_duration_changes_immediately() {
+        let now = Instant::now();
+        let mut drawer = TrayDrawer::default();
+        assert!(drawer.update(true, false, now, Duration::ZERO));
+        assert_eq!(drawer.progress, 1.0);
+        assert!(!drawer.is_animating());
+        assert!(!drawer.update(true, false, now, Duration::ZERO));
+        assert!(drawer.update(false, false, now, Duration::ZERO));
+        assert_eq!(drawer.progress, 0.0);
+    }
     use super::*;
 
     #[test]
@@ -1799,8 +2407,10 @@ mod tests {
                         clock: "12:00",
                         keyboard_layout: "en",
                         tray_icons: &[],
+                        tray_reveal: 0.0,
                         workspaces: &workspaces,
                         tasks: &[],
+                        media: None,
                     },
                 )
                 .unwrap();
@@ -1809,12 +2419,11 @@ mod tests {
                     expected.swap(0, 2);
                 }
                 assert_eq!(&canvas[400 * 4..401 * 4], &expected);
-                assert_eq!(hitboxes.len(), WORKSPACES_PER_OUTPUT);
-                assert!(
-                    hitboxes
-                        .iter()
-                        .all(|hitbox| matches!(hitbox.target, HitTarget::Workspace { .. }))
-                );
+                assert_eq!(hitboxes.len(), WORKSPACES_PER_OUTPUT + 1);
+                assert!(hitboxes.iter().all(|hitbox| matches!(
+                    hitbox.target,
+                    HitTarget::Workspace { .. } | HitTarget::Clock
+                )));
                 if rgba[3] < 255 {
                     // Antialiased glyphs need not have fully opaque pixels.
                     assert!(canvas.chunks_exact(4).any(|pixel| pixel[3] > rgba[3]));

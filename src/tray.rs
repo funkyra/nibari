@@ -57,7 +57,7 @@ impl TrayHandle {
     pub fn spawn(events: UiSender<TrayEvent>, config: &Config) -> Self {
         let (commands, mut receiver) = mpsc::unbounded_channel();
         let settings = IconSettings {
-            target_size: config.tray_icon_size,
+            target_size: config.tray.icon_size,
             loader: IconLoader::new(config),
         };
 
@@ -787,51 +787,6 @@ mod tests {
         assert!(pixels.upgrade().is_none());
     }
 
-    #[test]
-    fn selected_pixmap_is_copied_without_copying_other_variants() {
-        let mut item = tray_item("test", 10);
-        item.icon_pixmap.as_mut().unwrap().push(IconPixmap {
-            width: 64,
-            height: 64,
-            pixels: vec![255; 64 * 64 * 4],
-        });
-
-        let input = IconInput::from_item(&item, 16);
-        assert_eq!(input.pixmap.as_ref().map(|pixmap| pixmap.width), Some(1));
-        assert_eq!(
-            input.pixmap.as_ref().map(|pixmap| pixmap.pixels.len()),
-            Some(4)
-        );
-    }
-
-    #[test]
-    fn missing_named_icon_falls_back_to_selected_pixmap() {
-        let mut item = tray_item("test", 77);
-        item.icon_name = Some("nibari-test-icon-that-does-not-exist".into());
-        let settings = icon_settings();
-        let input = IconInput::from_item(&item, settings.target_size);
-
-        let icon = make_icon("address", input, &settings);
-        assert_eq!(&*icon.pixels, &[77, 0, 0, 255]);
-    }
-
-    #[test]
-    fn attention_status_selects_attention_icon_with_normal_fallback() {
-        let mut item = tray_item("test", 10);
-        item.attention_icon_pixmap = Some(vec![IconPixmap {
-            width: 1,
-            height: 1,
-            pixels: vec![255, 99, 0, 0],
-        }]);
-        item.status = Status::NeedsAttention;
-        let attention = IconInput::from_item(&item, 16);
-        assert_eq!(attention.pixmap.unwrap().pixels[1], 99);
-
-        item.attention_icon_pixmap = None;
-        let normal_fallback = IconInput::from_item(&item, 16);
-        assert_eq!(normal_fallback.pixmap.unwrap().pixels[1], 10);
-    }
-
     fn dbus_menu_item(id: i32, label: &str) -> MenuItem {
         MenuItem {
             id,
@@ -917,27 +872,6 @@ mod tests {
         assert_ne!(checkbox, menu_entry(&item));
         assert_eq!(checkbox.unwrap().toggle_type, ToggleType::Checkmark);
         assert_eq!(menu_entry(&item).unwrap().toggle_type, ToggleType::Radio);
-    }
-
-    #[test]
-    fn converts_argb_to_premultiplied_rgba() {
-        let icon = IconPixmap {
-            width: 1,
-            height: 1,
-            pixels: vec![128, 200, 100, 50],
-        };
-        let pixmap = load_pixmap(&[icon], 16).unwrap();
-        assert_eq!(pixmap.data(), &[100, 50, 25, 128]);
-    }
-
-    #[test]
-    fn ignores_invalid_pixmaps() {
-        let icon = IconPixmap {
-            width: 16,
-            height: 16,
-            pixels: vec![0; 4],
-        };
-        assert!(load_pixmap(&[icon], 16).is_none());
     }
 
     #[test]

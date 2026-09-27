@@ -79,9 +79,9 @@ pub struct WeatherOptions {
 impl From<&Config> for WeatherOptions {
     fn from(c: &Config) -> Self {
         Self {
-            location: c.weather_location.trim().into(),
-            coordinates: c.weather_latitude.zip(c.weather_longitude),
-            interval: Duration::from_secs(u64::from(c.weather_refresh_minutes) * 60),
+            location: c.weather.location.trim().into(),
+            coordinates: c.weather.latitude.zip(c.weather.longitude),
+            interval: Duration::from_secs(u64::from(c.weather.refresh_minutes) * 60),
         }
     }
 }
@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn city_query_encodes_separators_and_utf8() {
         assert_eq!(encode("New York&x=1"), "New%20York%26x%3D1");
-        assert_eq!(encode("Уфа"), "%D0%A3%D1%84%D0%B0");
+        assert_eq!(encode("Málaga"), "M%C3%A1laga");
     }
     #[test]
     fn automatic_location_requires_success_and_valid_coordinates() {

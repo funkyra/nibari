@@ -262,7 +262,7 @@ pub fn spawn(events: UiSender<NiriEvent>, config: &Config) -> NiriHandle {
 
 fn listen_forever(events: UiSender<NiriEvent>, config: Config) {
     let mut icons = config
-        .show_tasks
+        .tasks.enabled
         .then(|| ApplicationIconCache::new(&config));
     loop {
         if let Err(error) = listen(&events, icons.as_mut()) {
@@ -511,7 +511,7 @@ impl ApplicationIconCache {
     fn new(config: &Config) -> Self {
         Self {
             loader: IconLoader::new(config),
-            target_size: config.task_icon_size,
+            target_size: config.tasks.icon_size,
             icons: HashMap::new(),
         }
     }

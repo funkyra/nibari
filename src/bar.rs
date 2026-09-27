@@ -25,7 +25,9 @@ use smithay_client_toolkit::{
     seat::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
-        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        pointer::{
+            CursorIcon, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec, ThemedPointer,
+        },
     },
     shell::{
         WaylandSurface,
@@ -53,6 +55,7 @@ use wayland_client::{
 };
 
 use crate::{
+    bluetooth::{BluetoothHandle, PromptKind, Snapshot as BluetoothSnapshot},
     config::Config,
     media::{MediaHandle, MediaSnapshot},
     memory::{self, TrimSchedule},
@@ -63,6 +66,7 @@ use crate::{
     },
     render::{
         HitTarget, Hitbox, MenuHitbox, MenuSelection, PreparedPopup, RenderContent, Renderer,
+        bluetooth::{Page as BluetoothPage, UiAction as BluetoothUiAction},
         calendar::{CalendarPalette, shifted_month},
         hit_target_at,
         network::NetworkPalette,
@@ -114,17 +118,17 @@ pub fn run(config: Config) -> Result<()> {
     let tray = TrayHandle::spawn(tray_events, &config);
     let (media_events, media_channel) = channel::channel();
     let media = config
-        .media_enabled
+        .media.enabled
         .then(|| MediaHandle::spawn(media_events, &config));
     let (niri_events, niri_channel) = channel::channel();
     let niri = niri::spawn(niri_events, &config);
-    let clock_granularity = clock_granularity(&config.clock_format);
+    let clock_granularity = clock_granularity(&config.clock.format);
     let renderer = Renderer::new(&config);
     let background_opaque = config.background_rgba()[3] == 255;
     let calendar_palette = CalendarPalette::from(&config);
     let weather_palette = WeatherPalette::from(&config);
     let (weather_events, weather_channel) = channel::channel();
-    let weather = if config.weather_enabled {
+    let weather = if config.weather.enabled {
         match WeatherHandle::spawn(weather_events, WeatherOptions::from(&config)) {
             Ok(handle) => Some(handle),
             Err(error) => {
@@ -137,22 +141,35 @@ pub fn run(config: Config) -> Result<()> {
     };
     let network_palette = NetworkPalette::from(&config);
     let network_target = config
-        .network_ping_target
+        .network.ping_target
         .parse()
         .expect("validated network target");
     let (network_events, network_channel) = channel::channel();
-    let network = if config.network_enabled {
+    let network = if config.network.enabled {
         match NetworkHandle::spawn(
             network_events,
             NetworkOptions {
-                interface: (!config.network_interface.is_empty())
-                    .then(|| config.network_interface.clone()),
+                interface: (!config.network.interface.is_empty())
+                    .then(|| config.network.interface.clone()),
                 ping_target: network_target,
             },
         ) {
             Ok(handle) => Some(handle),
             Err(error) => {
                 log::warn!("failed to start network monitoring: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (bluetooth_events, bluetooth_channel) = channel::channel();
+    let bluetooth = if config.bluetooth.enabled {
+        match BluetoothHandle::spawn(bluetooth_events) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                log::warn!("failed to start Bluetooth: {error}");
                 None
             }
         }
@@ -181,6 +198,11 @@ pub fn run(config: Config) -> Result<()> {
         network,
         network_snapshot: NetworkSnapshot::default(),
         network_visible: false,
+        bluetooth,
+        bluetooth_snapshot: Arc::new(BluetoothSnapshot::default()),
+        bluetooth_visible: false,
+        bluetooth_page: BluetoothPage::Root,
+        bluetooth_input: String::new(),
         renderer,
         background_opaque,
         bars_hidden: false,
@@ -235,15 +257,35 @@ pub fn run(config: Config) -> Result<()> {
             .map_err(|error| anyhow::anyhow!("failed to attach network events: {error}"))?;
     }
 
+    if app.bluetooth.is_some() {
+        event_loop
+            .handle()
+            .insert_source(bluetooth_channel, |event, _, app| {
+                if let ChannelEvent::Msg(snapshot) = event {
+                    if app.renderer.set_bluetooth_state(snapshot.icon_state()) {
+                        app.mark_bars_dirty();
+                    }
+                    if app.bluetooth_snapshot.prompt.as_ref().map(|p| p.id)
+                        != snapshot.prompt.as_ref().map(|p| p.id)
+                    {
+                        app.bluetooth_input.clear();
+                    }
+                    app.bluetooth_snapshot = snapshot;
+                    app.update_bluetooth_popup();
+                }
+            })
+            .map_err(|error| anyhow::anyhow!("failed to attach Bluetooth events: {error}"))?;
+    }
+
     if app.media.is_some() {
         event_loop
             .handle()
             .insert_source(media_channel, |event, _, app| {
-                if let ChannelEvent::Msg(snapshot) = event {
-                    if app.media_snapshot != snapshot {
-                        app.media_snapshot = snapshot;
-                        app.mark_bars_dirty();
-                    }
+                if let ChannelEvent::Msg(snapshot) = event
+                    && app.media_snapshot != snapshot
+                {
+                    app.media_snapshot = snapshot;
+                    app.mark_bars_dirty();
                 }
             })
             .map_err(|error| anyhow::anyhow!("failed to attach media events: {error}"))?;
@@ -388,6 +430,7 @@ struct MenuSurface {
     prepared: PreparedPopup,
     calendar_scroll: f64,
     selected: Option<MenuSelection>,
+    pointer_position: Option<(f64, f64)>,
     anchor_x: i32,
     output_width: u32,
     output_height: u32,
@@ -416,6 +459,12 @@ struct MenuPage {
     entries: Vec<TrayMenuEntry>,
 }
 
+struct AppPointer {
+    seat: wl_seat::WlSeat,
+    themed: ThemedPointer,
+    icon: Option<CursorIcon>,
+}
+
 struct App {
     registry_state: RegistryState,
     output_state: OutputState,
@@ -437,13 +486,18 @@ struct App {
     network: Option<NetworkHandle>,
     network_snapshot: NetworkSnapshot,
     network_visible: bool,
+    bluetooth: Option<BluetoothHandle>,
+    bluetooth_snapshot: Arc<BluetoothSnapshot>,
+    bluetooth_visible: bool,
+    bluetooth_page: BluetoothPage,
+    bluetooth_input: String,
     renderer: Renderer,
     background_opaque: bool,
     bars_hidden: bool,
     surfaces: Vec<BarSurface>,
     menu_surface: Option<MenuSurface>,
     menu_was_open: bool,
-    pointers: Vec<(wl_seat::WlSeat, wl_pointer::WlPointer)>,
+    pointers: Vec<AppPointer>,
     keyboards: Vec<(wl_seat::WlSeat, wl_keyboard::WlKeyboard)>,
     pending_menu_grab: Option<(wl_seat::WlSeat, u32, i32, i32)>,
     clock: String,
@@ -559,8 +613,8 @@ impl App {
             Some(&output),
         );
         layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_size(0, self.config.height);
-        layer.set_exclusive_zone(self.config.height as i32);
+        layer.set_size(0, self.config.bar.height);
+        layer.set_exclusive_zone(self.config.bar.height as i32);
         let _ = layer.set_buffer_scale(scale);
         layer.commit();
 
@@ -586,7 +640,7 @@ impl App {
             workspace_group: 0,
             content,
             logical_width: 0,
-            logical_height: self.config.height,
+            logical_height: self.config.bar.height,
             scale,
             configured: false,
             dirty: true,
@@ -668,7 +722,7 @@ impl App {
 
     fn update_clock(&mut self) {
         let now = Local::now();
-        let clock = now.format(&self.config.clock_format).to_string();
+        let clock = now.format(&self.config.clock.format).to_string();
         if clock != self.clock {
             self.clock = clock;
             self.mark_bars_dirty();
@@ -695,6 +749,19 @@ impl App {
     }
 
     fn draw_dirty(&mut self) -> Result<()> {
+        let bluetooth_visible = self
+            .menu_surface
+            .as_ref()
+            .is_some_and(|m| m.prepared.is_bluetooth());
+        if self.bluetooth_visible != bluetooth_visible {
+            self.bluetooth_visible = bluetooth_visible;
+            if let Some(bluetooth) = &self.bluetooth {
+                bluetooth.set_visible(bluetooth_visible);
+            }
+            if !bluetooth_visible {
+                self.bluetooth_input.clear();
+            }
+        }
         let network_visible = self
             .menu_surface
             .as_ref()
@@ -724,9 +791,9 @@ impl App {
         if old_count != self.keyboards.len() {
             self.schedule_memory_trim();
         }
-        if self.config.tray_drawer {
+        if self.config.tray.drawer {
             let now = Instant::now();
-            let duration = Duration::from_millis(u64::from(self.config.tray_drawer_duration_ms));
+            let duration = Duration::from_millis(u64::from(self.config.tray.drawer_duration_ms));
             for surface in &mut self.surfaces {
                 let hovered = surface.pointer_position.is_some_and(|(x, y)| {
                     matches!(
@@ -814,7 +881,7 @@ impl App {
     }
 
     fn show_weather(&mut self, x: i32, y: i32) {
-        if !self.config.weather_enabled {
+        if !self.config.weather.enabled {
             return;
         }
         let Some(target) = self.menu_target(x, y) else {
@@ -825,7 +892,7 @@ impl App {
         };
         let prepared = PreparedPopup::Weather(self.renderer.prepare_weather(
             &self.weather_state,
-            self.config.weather_units,
+            self.config.weather.units,
             target.scale,
             &self.weather_palette,
         ));
@@ -845,7 +912,7 @@ impl App {
         };
         let mut prepared = PreparedPopup::Weather(self.renderer.prepare_weather(
             &self.weather_state,
-            self.config.weather_units,
+            self.config.weather.units,
             menu.scale,
             &self.weather_palette,
         ));
@@ -853,7 +920,7 @@ impl App {
             &mut prepared,
             menu.scale,
             menu.output_width,
-            menu.output_height.saturating_sub(self.config.height),
+            menu.output_height.saturating_sub(self.config.bar.height),
         );
         let (w, h) = prepared.size();
         if (w.div_ceil(menu.scale), h.div_ceil(menu.scale))
@@ -866,8 +933,74 @@ impl App {
         menu.dirty = true;
     }
 
+    fn show_bluetooth(&mut self, x: i32, y: i32) {
+        if !self.config.bluetooth.enabled {
+            return;
+        }
+        let Some(target) = self.menu_target(x, y) else {
+            return;
+        };
+        let Some((seat, serial, _, _)) = self.pending_menu_grab.take() else {
+            return;
+        };
+        self.bluetooth_page = BluetoothPage::Root;
+        self.bluetooth_input.clear();
+        let prepared = PreparedPopup::Bluetooth(self.renderer.prepare_bluetooth(
+            &self.bluetooth_snapshot,
+            &self.bluetooth_page,
+            &self.bluetooth_input,
+            target.scale,
+            target.logical_width,
+        ));
+        self.show_popup(target, seat, serial, prepared, None);
+    }
+
+    fn update_bluetooth_popup(&mut self) {
+        let Some(menu) = self
+            .menu_surface
+            .as_mut()
+            .filter(|m| m.prepared.is_bluetooth())
+        else {
+            return;
+        };
+        let mut prepared = PreparedPopup::Bluetooth(self.renderer.prepare_bluetooth(
+            &self.bluetooth_snapshot,
+            &self.bluetooth_page,
+            &self.bluetooth_input,
+            menu.scale,
+            menu.output_width,
+        ));
+        constrain_menu(
+            &mut prepared,
+            menu.scale,
+            menu.output_width,
+            menu.output_height.saturating_sub(self.config.bar.height),
+        );
+        let (w, h) = prepared.size();
+        if (w.div_ceil(menu.scale), h.div_ceil(menu.scale))
+            != (menu.logical_width, menu.logical_height)
+        {
+            self.update_menu_page();
+            return;
+        }
+        if let (PreparedPopup::Bluetooth(next), PreparedPopup::Bluetooth(previous)) =
+            (&mut prepared, &menu.prepared)
+        {
+            let preserved = next.preserve_view(previous, menu.selected);
+            menu.selected = menu.pointer_position.map_or(preserved, |(x, y)| {
+                next.selection_at(
+                    (x * menu.scale as f64).floor() as i32,
+                    (y * menu.scale as f64).floor() as i32,
+                )
+            });
+        }
+        menu.prepared = prepared;
+        menu.hitboxes.clear();
+        menu.dirty = true;
+    }
+
     fn show_network(&mut self, x: i32, y: i32) {
-        if !self.config.network_enabled {
+        if !self.config.network.enabled {
             return;
         }
         let Some(target) = self.menu_target(x, y) else {
@@ -903,7 +1036,7 @@ impl App {
             &mut prepared,
             menu.scale,
             menu.output_width,
-            menu.output_height.saturating_sub(self.config.height),
+            menu.output_height.saturating_sub(self.config.bar.height),
         );
         let (w, h) = prepared.size();
         if (w.div_ceil(menu.scale), h.div_ceil(menu.scale))
@@ -917,7 +1050,7 @@ impl App {
     }
 
     fn show_calendar(&mut self, x: i32, y: i32) {
-        if !self.config.calendar_enabled {
+        if !self.config.calendar.enabled {
             return;
         }
         let Some(target) = self.menu_target(x, y) else {
@@ -948,7 +1081,7 @@ impl App {
             &mut prepared,
             target.scale,
             target.logical_width,
-            target.logical_height.saturating_sub(self.config.height),
+            target.logical_height.saturating_sub(self.config.bar.height),
         );
         let (buffer_width, buffer_height) = prepared.size();
         let logical_width =
@@ -961,7 +1094,7 @@ impl App {
             target.logical_width,
             prepared.centered(),
         );
-        let top = menu_top(self.config.height, logical_height, target.logical_height);
+        let top = menu_top(self.config.bar.height, logical_height, target.logical_height);
 
         self.menu_surface = None;
 
@@ -1032,6 +1165,7 @@ impl App {
             prepared,
             calendar_scroll: 0.0,
             selected: None,
+            pointer_position: None,
             anchor_x: target.local_x,
             output_width: target.logical_width,
             output_height: target.logical_height,
@@ -1086,10 +1220,18 @@ impl App {
         let Some(menu) = self.menu_surface.as_mut() else {
             return;
         };
-        menu.prepared = if menu.prepared.is_weather() {
+        menu.prepared = if menu.prepared.is_bluetooth() {
+            PreparedPopup::Bluetooth(self.renderer.prepare_bluetooth(
+                &self.bluetooth_snapshot,
+                &self.bluetooth_page,
+                &self.bluetooth_input,
+                menu.scale,
+                menu.output_width,
+            ))
+        } else if menu.prepared.is_weather() {
             PreparedPopup::Weather(self.renderer.prepare_weather(
                 &self.weather_state,
-                self.config.weather_units,
+                self.config.weather.units,
                 menu.scale,
                 &self.weather_palette,
             ))
@@ -1118,7 +1260,7 @@ impl App {
             &mut menu.prepared,
             menu.scale,
             menu.output_width,
-            menu.output_height.saturating_sub(self.config.height),
+            menu.output_height.saturating_sub(self.config.bar.height),
         );
         let (buffer_width, buffer_height) = menu.prepared.size();
         let logical_width = bounded_dimension(buffer_width.div_ceil(menu.scale), menu.output_width);
@@ -1130,11 +1272,16 @@ impl App {
             menu.output_width,
             menu.prepared.centered(),
         );
-        let top = menu_top(self.config.height, logical_height, menu.output_height);
+        let top = menu_top(self.config.bar.height, logical_height, menu.output_height);
 
         menu.logical_width = logical_width;
         menu.logical_height = logical_height;
-        menu.selected = None;
+        menu.selected = menu.pointer_position.and_then(|(x, y)| {
+            menu.prepared.selection_at(
+                (x * menu.scale as f64).floor() as i32,
+                (y * menu.scale as f64).floor() as i32,
+            )
+        });
         menu.hitboxes.clear();
         menu.buffers.clear();
         menu.dirty = true;
@@ -1204,6 +1351,53 @@ impl App {
         if self
             .menu_surface
             .as_ref()
+            .is_some_and(|m| m.prepared.is_bluetooth())
+        {
+            match action {
+                MenuInputAction::Dismiss => self.menu_surface = None,
+                MenuInputAction::Back => {
+                    if self.bluetooth_page == BluetoothPage::Root {
+                        self.menu_surface = None;
+                    } else {
+                        self.bluetooth_page = self.bluetooth_page.parent();
+                        self.update_menu_page();
+                    }
+                }
+                MenuInputAction::Activate(id) => {
+                    let action = self.menu_surface.as_ref().and_then(|m| match &m.prepared {
+                        PreparedPopup::Bluetooth(p) => p.action(id).cloned(),
+                        _ => None,
+                    });
+                    match action {
+                        Some(BluetoothUiAction::Page(page)) => {
+                            self.bluetooth_page = page;
+                            self.update_menu_page();
+                        }
+                        Some(BluetoothUiAction::Act(action)) => {
+                            if let Some(bluetooth) = &self.bluetooth {
+                                bluetooth.act(action);
+                            }
+                        }
+                        Some(BluetoothUiAction::Reply(id, accept)) => {
+                            if let Some(bluetooth) = &self.bluetooth {
+                                bluetooth.reply(id, accept.then(|| self.bluetooth_input.clone()));
+                            }
+                        }
+                        Some(BluetoothUiAction::CancelPair) => {
+                            if let Some(bluetooth) = &self.bluetooth {
+                                bluetooth.cancel_pairing();
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self
+            .menu_surface
+            .as_ref()
             .is_some_and(|menu| menu.prepared.is_weather())
         {
             match action {
@@ -1266,6 +1460,54 @@ impl App {
     }
 
     fn handle_menu_key(&mut self, keysym: Keysym) {
+        if self
+            .menu_surface
+            .as_ref()
+            .is_some_and(|m| m.prepared.is_bluetooth())
+        {
+            if let Some(prompt) = &self.bluetooth_snapshot.prompt
+                && matches!(prompt.kind, PromptKind::Pin | PromptKind::Passkey)
+            {
+                match keysym {
+                    Keysym::BackSpace => {
+                        self.bluetooth_input.pop();
+                        self.update_bluetooth_popup();
+                        return;
+                    }
+                    Keysym::Return | Keysym::KP_Enter
+                        if prompt.kind.accepts(&self.bluetooth_input) =>
+                    {
+                        if let Some(bluetooth) = &self.bluetooth {
+                            bluetooth.reply(prompt.id, Some(self.bluetooth_input.clone()));
+                        }
+                        return;
+                    }
+                    _ => {
+                        if let Some(ch) = keysym
+                            .key_char()
+                            .filter(|ch| ch.is_ascii() && !ch.is_control())
+                        {
+                            let limit = if prompt.kind == PromptKind::Passkey {
+                                6
+                            } else {
+                                16
+                            };
+                            if self.bluetooth_input.len() < limit
+                                && (prompt.kind == PromptKind::Pin || ch.is_ascii_digit())
+                            {
+                                self.bluetooth_input.push(ch);
+                                self.update_bluetooth_popup();
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            if keysym == Keysym::Left {
+                self.apply_menu_action(MenuInputAction::Back);
+                return;
+            }
+        }
         let Some(menu) = self.menu_surface.as_mut() else {
             return;
         };
@@ -1375,6 +1617,16 @@ impl App {
                 let global_x = bar.output_position.0 + (icon.x + icon.width / 2) / bar.scale as i32;
                 let global_y = bar.output_position.1 + y.round() as i32;
                 self.show_weather(global_x, global_y);
+            }
+            Some(HitTarget::Bluetooth) if button == BTN_LEFT => {
+                let icon = bar
+                    .hitboxes
+                    .iter()
+                    .find(|hit| hit.target == HitTarget::Bluetooth)
+                    .expect("Bluetooth hitbox exists");
+                let global_x = bar.output_position.0 + (icon.x + icon.width / 2) / bar.scale as i32;
+                let global_y = bar.output_position.1 + y.round() as i32;
+                self.show_bluetooth(global_x, global_y);
             }
             Some(HitTarget::Network) if button == BTN_LEFT => {
                 let icon = bar
@@ -1880,7 +2132,7 @@ impl LayerShellHandler for App {
         let height = if configure.new_size.1 > 0 {
             configure.new_size.1
         } else {
-            self.config.height
+            self.config.bar.height
         };
         if surface.logical_width != width || surface.logical_height != height {
             surface.buffers.clear();
@@ -1993,14 +2245,7 @@ impl SeatHandler for App {
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
-        self.pointers.retain(|(current, pointer)| {
-            if current == &seat {
-                pointer.release();
-                false
-            } else {
-                true
-            }
-        });
+        self.pointers.retain(|current| current.seat != seat);
         self.keyboards.retain(|(current, keyboard)| {
             if current == &seat {
                 keyboard.release();
@@ -2019,10 +2264,21 @@ impl SeatHandler for App {
         capability: Capability,
     ) {
         if capability == Capability::Pointer
-            && !self.pointers.iter().any(|(current, _)| current == &seat)
+            && !self.pointers.iter().any(|current| current.seat == seat)
         {
-            match self.seat_state.get_pointer(queue_handle, &seat) {
-                Ok(pointer) => self.pointers.push((seat.clone(), pointer)),
+            let surface = self.compositor.create_surface(queue_handle);
+            match self.seat_state.get_pointer_with_theme::<_, ()>(
+                queue_handle,
+                &seat,
+                self.shm.wl_shm(),
+                surface,
+                ThemeSpec::default(),
+            ) {
+                Ok(themed) => self.pointers.push(AppPointer {
+                    seat: seat.clone(),
+                    themed,
+                    icon: None,
+                }),
                 Err(error) => log::warn!("failed to create Wayland pointer: {error}"),
             }
         }
@@ -2048,14 +2304,7 @@ impl SeatHandler for App {
         capability: Capability,
     ) {
         if capability == Capability::Pointer {
-            self.pointers.retain(|(current, pointer)| {
-                if current == &seat {
-                    pointer.release();
-                    false
-                } else {
-                    true
-                }
-            });
+            self.pointers.retain(|current| current.seat != seat);
         }
         if capability == Capability::Keyboard {
             self.keyboards.retain(|(current, keyboard)| {
@@ -2161,7 +2410,7 @@ impl KeyboardHandler for App {
 impl PointerHandler for App {
     fn pointer_frame(
         &mut self,
-        _: &Connection,
+        connection: &Connection,
         _: &QueueHandle<Self>,
         pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
@@ -2171,7 +2420,7 @@ impl PointerHandler for App {
                 .menu_surface
                 .as_ref()
                 .is_some_and(|menu| menu.popup.wl_surface() == &event.surface);
-            if self.config.tray_drawer
+            if self.config.tray.drawer
                 && let Some(bar) = self
                     .surfaces
                     .iter_mut()
@@ -2188,6 +2437,7 @@ impl PointerHandler for App {
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } if is_menu => {
                     if let Some(menu) = self.menu_surface.as_mut() {
+                        menu.pointer_position = Some(event.position);
                         let x = (event.position.0 * menu.scale as f64).floor() as i32;
                         let y = (event.position.1 * menu.scale as f64).floor() as i32;
                         let selected = menu.prepared.selection_at(x, y);
@@ -2198,10 +2448,11 @@ impl PointerHandler for App {
                     }
                 }
                 PointerEventKind::Leave { .. } if is_menu => {
-                    if let Some(menu) = self.menu_surface.as_mut()
-                        && menu.selected.take().is_some()
-                    {
-                        menu.dirty = true;
+                    if let Some(menu) = self.menu_surface.as_mut() {
+                        menu.pointer_position = None;
+                        if menu.selected.take().is_some() {
+                            menu.dirty = true;
+                        }
                     }
                 }
                 PointerEventKind::Axis { vertical, .. } if is_menu => {
@@ -2234,7 +2485,12 @@ impl PointerHandler for App {
                             .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
                             as i32;
                         if menu.prepared.scroll_by(physical_delta) {
-                            menu.selected = None;
+                            menu.selected = menu.pointer_position.and_then(|(x, y)| {
+                                menu.prepared.selection_at(
+                                    (x * menu.scale as f64).floor() as i32,
+                                    (y * menu.scale as f64).floor() as i32,
+                                )
+                            });
                             menu.dirty = true;
                         }
                     }
@@ -2257,12 +2513,70 @@ impl PointerHandler for App {
                         self.pending_menu_grab = self
                             .pointers
                             .iter()
-                            .find(|(_, current)| current == pointer)
-                            .map(|(seat, _)| (seat.clone(), serial, global_x, global_y));
+                            .find(|current| current.themed.pointer() == pointer)
+                            .map(|current| (current.seat.clone(), serial, global_x, global_y));
                     }
                     self.handle_click(&event.surface, button, event.position.0, event.position.1)
                 }
                 _ => {}
+            }
+            let entering = matches!(event.kind, PointerEventKind::Enter { .. });
+            if entering
+                || matches!(
+                    event.kind,
+                    PointerEventKind::Motion { .. }
+                        | PointerEventKind::Press { .. }
+                        | PointerEventKind::Axis { .. }
+                )
+            {
+                let actionable = if let Some(menu) = self
+                    .menu_surface
+                    .as_ref()
+                    .filter(|menu| menu.popup.wl_surface() == &event.surface)
+                {
+                    menu.prepared
+                        .selection_at(
+                            (event.position.0 * menu.scale as f64).floor() as i32,
+                            (event.position.1 * menu.scale as f64).floor() as i32,
+                        )
+                        .is_some()
+                } else {
+                    self.surfaces
+                        .iter()
+                        .find(|bar| bar.layer.wl_surface() == &event.surface)
+                        .is_some_and(|bar| {
+                            hit_target_at(
+                                &bar.hitboxes,
+                                bar.scale,
+                                event.position.0,
+                                event.position.1,
+                            )
+                            .is_some_and(|target| target != HitTarget::TrayDrawer)
+                        })
+                };
+                let icon = if actionable {
+                    CursorIcon::Pointer
+                } else {
+                    CursorIcon::Default
+                };
+                if let Some(current) = self
+                    .pointers
+                    .iter_mut()
+                    .find(|current| current.themed.pointer() == pointer)
+                    && (entering || current.icon != Some(icon))
+                {
+                    match current.themed.set_cursor(connection, icon) {
+                        Ok(()) => current.icon = Some(icon),
+                        Err(error) => log::debug!("failed to set pointer cursor: {error}"),
+                    }
+                }
+            } else if matches!(event.kind, PointerEventKind::Leave { .. })
+                && let Some(current) = self
+                    .pointers
+                    .iter_mut()
+                    .find(|current| current.themed.pointer() == pointer)
+            {
+                current.icon = None;
             }
         }
     }
@@ -2387,13 +2701,16 @@ mod tests {
             ("#204060", [32, 64, 96, 255]),
         ] {
             let config = Config {
-                background: background.into(),
+                bar: crate::config::BarConfig {
+                    background: background.into(),
+                    ..Default::default()
+                },
                 ..Config::default()
             };
             let mut renderer = Renderer::new(&config);
             for format in [wl_shm::Format::Argb8888, wl_shm::Format::Abgr8888] {
                 // Reused buffers may contain an opaque previous frame.
-                let mut canvas = vec![255; 800 * config.height as usize * 4];
+                let mut canvas = vec![255; 800 * config.bar.height as usize * 4];
                 let mut hitboxes = Vec::new();
                 render_canvas(
                     &mut canvas,
@@ -2401,7 +2718,7 @@ mod tests {
                     &mut hitboxes,
                     FrameSpec {
                         width: 800,
-                        height: config.height,
+                        height: config.bar.height,
                         scale: 1,
                         format,
                         clock: "12:00",

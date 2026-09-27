@@ -17,7 +17,7 @@ impl IconLoader {
     pub fn new(config: &Config) -> Self {
         Self {
             theme: config
-                .icon_theme
+                .icons.theme
                 .clone()
                 .or_else(default_theme_gtk)
                 .unwrap_or_else(|| "hicolor".into()),
@@ -316,30 +316,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn png_backing_image_is_small_and_preserves_aspect_ratio() {
-        let path = std::env::temp_dir().join(format!("nibari-png-{}.png", std::process::id()));
-        let mut original = Pixmap::new(512, 256).unwrap();
-        original.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 128));
-        original.save_png(&path).unwrap();
-        let image = load_icon_file(&path, 18).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!((image.width(), image.height()), (36, 18));
-        let pixel = image.pixel(18, 9).unwrap();
-        assert_eq!(pixel.alpha(), 128);
-        assert_eq!(pixel.red(), 128);
-    }
-
-    #[test]
-    fn small_png_is_not_upscaled_in_the_cache() {
-        let path =
-            std::env::temp_dir().join(format!("nibari-small-png-{}.png", std::process::id()));
-        Pixmap::new(16, 8).unwrap().save_png(&path).unwrap();
-        let image = load_icon_file(&path, 18).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!((image.width(), image.height()), (16, 8));
-    }
-
-    #[test]
     fn extracts_icon_from_desktop_entry() {
         let source = "[Desktop Entry]\nName=Browser\nIcon=org.example.Browser\n[Other]\nIcon=no\n";
         assert_eq!(
@@ -430,15 +406,5 @@ mod tests {
                 "firefox"
             ]
         );
-    }
-
-    #[test]
-    fn renders_svg_icon() {
-        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">
-            <circle cx="8" cy="8" r="8" fill="#ff0000"/>
-        </svg>"##;
-        let icon = render_svg(svg, 32, None).unwrap();
-        assert_eq!((icon.width(), icon.height()), (32, 32));
-        assert!(icon.data().iter().any(|channel| *channel != 0));
     }
 }

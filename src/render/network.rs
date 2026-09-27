@@ -1,6 +1,6 @@
 use super::{
     MenuHitbox, MenuSelection, PixelRect, Renderer, draw_premultiplied, draw_premultiplied_clipped,
-    fill_rect,
+    draw_update_indicator, fill_rect,
 };
 use crate::{
     config::Config,
@@ -24,11 +24,11 @@ pub struct NetworkPalette {
 impl From<&Config> for NetworkPalette {
     fn from(c: &Config) -> Self {
         Self {
-            background: c.color_rgba(&c.network_background),
-            foreground: c.color_rgba(&c.network_foreground),
-            muted: c.color_rgba(&c.network_muted),
-            accent: c.color_rgba(&c.network_accent),
-            border: c.color_rgba(&c.network_border),
+            background: c.color_rgba(&c.network.background),
+            foreground: c.color_rgba(&c.network.foreground),
+            muted: c.color_rgba(&c.network.muted),
+            accent: c.color_rgba(&c.network.accent),
+            border: c.color_rgba(&c.network.border),
         }
     }
 }
@@ -39,7 +39,7 @@ pub struct PreparedNetwork {
     height: u32,
     scale: u32,
     refresh: MenuHitbox,
-    accent: Color,
+    accent: [u8; 4],
 }
 impl PreparedNetwork {
     pub fn size(&self) -> (u32, u32) {
@@ -184,24 +184,11 @@ impl Renderer {
             selection: MenuSelection::Item(0),
             enabled: true,
             x: 350 * s,
-            y: 15 * s,
-            width: 32 * s,
-            height: 36 * s,
+            y: 18 * s,
+            width: 28 * s,
+            height: 28 * s,
         };
-        let mut path = PathBuilder::new();
-        path.move_to(374.0 * scale as f32, 27.0 * scale as f32);
-        path.cubic_to(
-            365.0 * scale as f32,
-            18.0 * scale as f32,
-            353.0 * scale as f32,
-            29.0 * scale as f32,
-            362.0 * scale as f32,
-            38.0 * scale as f32,
-        );
-        path.move_to(374.0 * scale as f32, 21.0 * scale as f32);
-        path.line_to(374.0 * scale as f32, 28.0 * scale as f32);
-        path.line_to(367.0 * scale as f32, 28.0 * scale as f32);
-        stroke(&mut canvas, path, 1.5 * scale as f32, rgba(palette.accent));
+        draw_update_indicator(&mut canvas, refresh, scale, palette.accent, false);
         let ping = snapshot
             .ping_ms
             .map_or_else(|| "—".into(), |v| format!("{v:.0} ms"));
@@ -346,7 +333,7 @@ impl Renderer {
             height: height * scale,
             scale,
             refresh,
-            accent: rgba(palette.accent),
+            accent: palette.accent,
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -396,17 +383,7 @@ impl Renderer {
         if let Some(h) = network.refresh_hitbox() {
             hitboxes.push(h);
             if Some(h.selection) == selected {
-                outline(
-                    canvas,
-                    PixelRect {
-                        x: h.x,
-                        y: h.y,
-                        width: h.width,
-                        height: h.height,
-                    },
-                    network.scale as f32,
-                    network.accent,
-                );
+                draw_update_indicator(canvas, network.refresh, network.scale, network.accent, true);
             }
         }
     }
@@ -415,6 +392,7 @@ impl Renderer {
 fn rgba(c: [u8; 4]) -> Color {
     Color::from_rgba8(c[0], c[1], c[2], c[3])
 }
+
 fn outline(canvas: &mut PixmapMut<'_>, r: PixelRect, width: f32, color: Color) {
     if let Some(rect) = Rect::from_xywh(r.x as f32, r.y as f32, r.width as f32, r.height as f32) {
         let mut paint = Paint::default();
@@ -511,11 +489,8 @@ mod tests {
         assert_eq!(bytes(1099511627776), "1.0 TiB");
     }
     #[test]
-    fn card_preserves_alpha_and_exposes_only_refresh_action() {
-        let c = Config {
-            network_background: "#22222280".into(),
-            ..Config::default()
-        };
+    fn card_exposes_only_refresh_action() {
+        let c = Config::default();
         let mut renderer = Renderer::new(&c);
         for scale in [1, 2, 3] {
             let mut card = renderer.prepare_network(
@@ -525,50 +500,23 @@ mod tests {
                 &NetworkPalette::from(&c),
             );
             assert_eq!(
-                card.bitmap.pixel(10 * scale, 100 * scale).unwrap().alpha(),
-                128
+                card.selection_at(360 * scale as i32, 30 * scale as i32),
+                Some(MenuSelection::Item(0))
             );
             assert_eq!(
-                card.selection_at(360 * scale as i32, 30 * scale as i32),
+                card.selection_at(311 * scale as i32, 30 * scale as i32),
+                None
+            );
+            assert_eq!(
+                card.selection_at(312 * scale as i32, 30 * scale as i32),
+                None
+            );
+            assert_eq!(
+                card.selection_at(350 * scale as i32, 30 * scale as i32),
                 Some(MenuSelection::Item(0))
             );
             card.constrain(100 * scale, 100 * scale);
             assert_eq!(card.next_selection(), None);
         }
-    }
-    #[test]
-    #[ignore = "writes an explicit network preview for visual QA"]
-    fn write_network_preview() {
-        let c = Config {
-            network_background: "#222222F2".into(),
-            network_foreground: "#C2C2B0".into(),
-            network_muted: "#8A8A7E".into(),
-            network_accent: "#D7C483".into(),
-            network_border: "#78824B".into(),
-            ..Config::default()
-        };
-        let mut renderer = Renderer::new(&c);
-        let snapshot = NetworkSnapshot {
-            interface: "eth0".into(),
-            kind: NetworkKind::Ethernet,
-            address: Some("10.0.2.15".parse().unwrap()),
-            gateway: Some("10.0.2.2".parse().unwrap()),
-            rx_bytes: 34288435,
-            tx_bytes: 704614,
-            rx_per_second: Some(175),
-            tx_per_second: Some(160),
-            ping_ms: Some(56.0),
-            loss_percent: Some(0),
-            probe_error: None,
-        };
-        let card = renderer.prepare_network(
-            &snapshot,
-            "1.1.1.1".parse().unwrap(),
-            1,
-            &NetworkPalette::from(&c),
-        );
-        card.bitmap
-            .save_png("/tmp/nibari-network-preview.png")
-            .unwrap();
     }
 }

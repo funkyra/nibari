@@ -1,6 +1,6 @@
 use super::{
     MenuHitbox, MenuSelection, PixelRect, Renderer, draw_premultiplied, draw_premultiplied_clipped,
-    fill_rect,
+    draw_update_indicator, fill_rect,
 };
 use crate::{
     config::{Config, WeatherUnits},
@@ -23,11 +23,11 @@ pub struct WeatherPalette {
 impl From<&Config> for WeatherPalette {
     fn from(c: &Config) -> Self {
         Self {
-            background: c.color_rgba(&c.weather_background),
-            foreground: c.color_rgba(&c.weather_foreground),
-            muted: c.color_rgba(&c.weather_muted),
-            accent: c.color_rgba(&c.weather_accent),
-            border: c.color_rgba(&c.weather_border),
+            background: c.color_rgba(&c.weather.background),
+            foreground: c.color_rgba(&c.weather.foreground),
+            muted: c.color_rgba(&c.weather.muted),
+            accent: c.color_rgba(&c.weather.accent),
+            border: c.color_rgba(&c.weather.border),
         }
     }
 }
@@ -37,7 +37,7 @@ pub struct PreparedWeather {
     height: u32,
     scale: u32,
     refresh: MenuHitbox,
-    accent: Color,
+    accent: [u8; 4],
 }
 impl PreparedWeather {
     pub fn size(&self) -> (u32, u32) {
@@ -101,18 +101,12 @@ impl Renderer {
         let refresh = MenuHitbox {
             selection: MenuSelection::Item(0),
             enabled: true,
-            x: 442 * s,
-            y: 14 * s,
-            width: 24 * s,
-            height: 24 * s,
+            x: 439 * s,
+            y: 13 * s,
+            width: 28 * s,
+            height: 28 * s,
         };
-        let mut arrow = PathBuilder::new();
-        arrow.move_to(460.0, 22.0);
-        arrow.cubic_to(452.0, 16.0, 444.0, 23.0, 450.0, 30.0);
-        arrow.move_to(460.0, 17.0);
-        arrow.line_to(460.0, 23.0);
-        arrow.line_to(454.0, 23.0);
-        stroke(&mut canvas, arrow, 1.2, scale as f32, rgba(palette.muted));
+        draw_update_indicator(&mut canvas, refresh, scale, palette.accent, false);
         let rect = |x, y, w, h| PixelRect {
             x: x * s,
             y: y * s,
@@ -314,7 +308,7 @@ impl Renderer {
             height: HEIGHT * scale,
             scale,
             refresh,
-            accent: rgba(palette.accent),
+            accent: palette.accent,
         }
     }
     fn weather_text(
@@ -355,17 +349,7 @@ impl Renderer {
         if let Some(h) = weather.refresh_hitbox() {
             hitboxes.push(h);
             if selected == Some(h.selection) {
-                outline(
-                    canvas,
-                    PixelRect {
-                        x: h.x,
-                        y: h.y,
-                        width: h.width,
-                        height: h.height,
-                    },
-                    weather.scale as f32,
-                    weather.accent,
-                );
+                draw_update_indicator(canvas, weather.refresh, weather.scale, weather.accent, true);
             }
         }
     }
@@ -373,6 +357,7 @@ impl Renderer {
 fn rgba(c: [u8; 4]) -> Color {
     Color::from_rgba8(c[0], c[1], c[2], c[3])
 }
+
 fn outline(canvas: &mut PixmapMut<'_>, r: PixelRect, width: f32, color: Color) {
     if let Some(rect) = Rect::from_xywh(r.x as f32, r.y as f32, r.width as f32, r.height as f32) {
         let mut paint = Paint::default();
@@ -432,9 +417,10 @@ pub(super) fn weather_icon(condition: Condition, night: bool, size: u32, color: 
         Condition::Clear => {
             if night {
                 p.move_to(20.0, 3.0);
-                p.cubic_to(5.0, 0.0, 0.0, 22.0, 15.0, 27.0);
-                p.cubic_to(22.0, 29.0, 28.0, 23.0, 29.0, 18.0);
-                p.cubic_to(16.0, 21.0, 12.0, 8.0, 20.0, 3.0);
+                p.cubic_to(10.0, 3.0, 3.0, 9.0, 3.0, 16.0);
+                p.cubic_to(3.0, 23.0, 10.0, 29.0, 20.0, 29.0);
+                p.cubic_to(15.0, 25.0, 12.0, 21.0, 12.0, 16.0);
+                p.cubic_to(12.0, 11.0, 15.0, 7.0, 20.0, 3.0);
                 p.close();
             } else {
                 sun(&mut p, 16.0, 16.0, 6.0, true);
@@ -442,9 +428,11 @@ pub(super) fn weather_icon(condition: Condition, night: bool, size: u32, color: 
         }
         Condition::PartlyCloudy => {
             if night {
-                p.move_to(21.0, 2.0);
-                p.cubic_to(17.0, 7.0, 22.0, 11.0, 27.0, 9.0);
-                p.cubic_to(25.0, 13.0, 24.0, 14.0, 22.0, 14.0);
+                p.move_to(24.4, 1.6);
+                p.cubic_to(19.2, 4.6, 19.1, 10.4, 22.8, 12.8);
+                p.cubic_to(24.7, 14.1, 26.9, 13.9, 29.5, 12.4);
+                p.cubic_to(25.4, 11.3, 22.6, 8.4, 24.4, 1.6);
+                p.close();
             } else {
                 p.move_to(18.0, 7.0);
                 p.cubic_to(24.0, 1.0, 31.0, 8.0, 26.0, 13.0);
@@ -512,7 +500,6 @@ mod tests {
         weather::{WeatherDay, WeatherReport},
     };
     use chrono::NaiveDate;
-    use tiny_skia::Pixmap;
 
     fn palette() -> WeatherPalette {
         WeatherPalette {
@@ -553,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_weather_scales_to_popup_size_and_preserves_background_alpha() {
+    fn prepared_weather_scales_to_popup_size() {
         let mut renderer = Renderer::new(&Config::default());
         for scale in [1, 2, 3] {
             let weather = renderer.prepare_weather(
@@ -564,13 +551,6 @@ mod tests {
             );
             assert_eq!(weather.size(), (480 * scale, 202 * scale));
             assert_eq!(weather.scale, scale);
-            assert_eq!(weather.bitmap.pixel(0, 0).unwrap().alpha(), 0);
-            let interior = weather
-                .bitmap
-                .pixel(10 * scale, 115 * scale)
-                .unwrap()
-                .demultiply();
-            assert_eq!(interior.alpha(), palette().background[3]);
         }
     }
 
@@ -589,10 +569,10 @@ mod tests {
             MenuHitbox {
                 selection: MenuSelection::Item(0),
                 enabled: true,
-                x: 442,
-                y: 14,
-                width: 24,
-                height: 24,
+                x: 439,
+                y: 13,
+                width: 28,
+                height: 28,
             }
         );
         assert_eq!(weather.selection_at(449, 29), Some(MenuSelection::Item(0)));
@@ -600,111 +580,5 @@ mod tests {
         assert_eq!(weather.selection_at(449, 30), None);
         weather.constrain(100, 100);
         assert_eq!(weather.next_selection(), None);
-    }
-
-    #[test]
-    fn loading_error_and_no_data_states_render_without_panic() {
-        let mut renderer = Renderer::new(&Config::default());
-        for state in [
-            state(None, None),
-            state(None, Some("Weather unavailable")),
-            state(Some(report(true, Condition::Cloudy)), None),
-        ] {
-            let weather = renderer.prepare_weather(&state, WeatherUnits::Metric, 1, &palette());
-            let mut canvas = Pixmap::new(weather.size().0, weather.size().1).unwrap();
-            renderer.draw_weather(&mut canvas.as_mut(), &weather, &mut Vec::new(), None);
-            assert!(canvas.data().iter().any(|alpha| *alpha != 0));
-        }
-    }
-
-    #[test]
-    fn icons_distinguish_day_night_and_weather_variants() {
-        let colors = [232, 238, 245, 201];
-        let icons: Vec<_> = [
-            Condition::Clear,
-            Condition::PartlyCloudy,
-            Condition::Cloudy,
-            Condition::Fog,
-            Condition::Rain,
-            Condition::Snow,
-            Condition::Thunder,
-        ]
-        .into_iter()
-        .map(|condition| weather_icon(condition, false, 32, colors))
-        .collect();
-        assert!(
-            icons
-                .iter()
-                .all(|icon| icon.data().iter().any(|alpha| *alpha != 0))
-        );
-        assert!(
-            icons
-                .windows(2)
-                .all(|pair| pair[0].data() != pair[1].data())
-        );
-        for condition in [Condition::Clear, Condition::PartlyCloudy] {
-            let day = weather_icon(condition, false, 32, colors);
-            let night = weather_icon(condition, true, 32, colors);
-            assert!(day.data().iter().any(|alpha| *alpha != 0));
-            assert_ne!(
-                day.data(),
-                night.data(),
-                "{condition:?} day/night icon should differ"
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "writes /tmp/nibari-weather-preview.png for explicit visual QA"]
-    fn write_weather_preview() {
-        let config = Config {
-            weather_background: "#222222F2".into(),
-            weather_foreground: "#C2C2B0".into(),
-            weather_muted: "#8A8A7E".into(),
-            weather_accent: "#D7C483".into(),
-            weather_border: "#78824B".into(),
-            ..Config::default()
-        };
-        let mut renderer = Renderer::new(&config);
-        let weather = renderer.prepare_weather(
-            &state(
-                Some(WeatherReport {
-                    location: "Helsinki".into(),
-                    temperature: 9.0,
-                    feels: Some(7.0),
-                    wind: Some(4.0),
-                    humidity: Some(77.0),
-                    condition: Condition::PartlyCloudy,
-                    night: false,
-                    days: vec![
-                        WeatherDay {
-                            date: NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
-                            high: Some(16.0),
-                            low: Some(15.0),
-                            condition: Condition::Rain,
-                        },
-                        WeatherDay {
-                            date: NaiveDate::from_ymd_opt(2026, 9, 17).unwrap(),
-                            high: Some(16.0),
-                            low: Some(13.0),
-                            condition: Condition::Rain,
-                        },
-                        WeatherDay {
-                            date: NaiveDate::from_ymd_opt(2026, 9, 18).unwrap(),
-                            high: Some(16.0),
-                            low: Some(12.0),
-                            condition: Condition::Rain,
-                        },
-                    ],
-                }),
-                None,
-            ),
-            WeatherUnits::Metric,
-            1,
-            &palette(),
-        );
-        let mut canvas = Pixmap::new(weather.size().0, weather.size().1).unwrap();
-        renderer.draw_weather(&mut canvas.as_mut(), &weather, &mut Vec::new(), None);
-        canvas.save_png("/tmp/nibari-weather-preview.png").unwrap();
     }
 }

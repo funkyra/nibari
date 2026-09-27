@@ -1,4 +1,5 @@
 mod bar;
+mod bluetooth;
 mod config;
 mod control;
 mod icons;

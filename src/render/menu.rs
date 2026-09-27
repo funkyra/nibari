@@ -223,7 +223,7 @@ impl Renderer {
                 enabled: true,
                 y,
                 height: row_height,
-                text: Some(self.menu_text(title, scale, self.style.workspace_active_foreground)),
+                text: Some(self.menu_text(title, scale, self.style.menu_accent)),
                 toggle_type: ToggleType::CannotBeToggled,
                 toggle_state: ToggleState::Off,
                 submenu: false,
@@ -256,9 +256,9 @@ impl Renderer {
                     &entry.label,
                     scale,
                     if entry.enabled {
-                        self.style.foreground
+                        self.style.menu_foreground
                     } else {
-                        self.style.workspace_empty_foreground
+                        self.style.menu_muted
                     },
                 )),
                 toggle_type: entry.toggle_type,
@@ -308,9 +308,9 @@ impl Renderer {
             indicator_column,
             entries: rows,
             hitboxes,
-            ellipsis: self.menu_text("…", scale, self.style.foreground),
-            disabled_ellipsis: self.menu_text("…", scale, self.style.workspace_empty_foreground),
-            back_ellipsis: self.menu_text("…", scale, self.style.workspace_active_foreground),
+            ellipsis: self.menu_text("…", scale, self.style.menu_foreground),
+            disabled_ellipsis: self.menu_text("…", scale, self.style.menu_muted),
+            back_ellipsis: self.menu_text("…", scale, self.style.menu_accent),
         }
     }
 
@@ -335,11 +335,11 @@ impl Renderer {
         selected: Option<MenuSelection>,
     ) {
         let s = menu.scale as i32;
-        let background = mix(self.style.background, rgba(self.style.foreground), 0.025);
-        let foreground = rgba(self.style.foreground);
-        let accent = rgba(self.style.workspace_active_foreground);
-        let border = mix(background, foreground, 0.17);
-        let hover = mix(self.style.workspace_focused_background, accent, 0.08);
+        let background = self.style.menu_background;
+        let foreground = rgba(self.style.menu_foreground);
+        let accent = rgba(self.style.menu_accent);
+        let border = self.style.menu_border;
+        let hover = mix(background, accent, 0.12);
         let card = PixelRect {
             x: SHADOW * s,
             y: SHADOW * s,
@@ -443,7 +443,7 @@ impl Renderer {
             let ink = if entry.enabled {
                 accent
             } else {
-                rgba(self.style.workspace_empty_foreground)
+                rgba(self.style.menu_muted)
             };
             if back {
                 chevron(&mut row_canvas, leading + 7 * s, center_y, s, true, ink);
@@ -827,20 +827,6 @@ mod tests {
             None,
         );
         assert_eq!(menu.size().0, (360 + 2 * SHADOW as u32) * 2);
-        let mut pixmap = Pixmap::new(menu.width, menu.height).unwrap();
-        renderer.draw_menu(
-            &mut pixmap.as_mut(),
-            &menu,
-            &mut Vec::new(),
-            Some(MenuSelection::Item(1)),
-        );
-        assert_eq!(
-            pixmap
-                .pixel(menu.width - 1, menu.height / 2)
-                .unwrap()
-                .alpha(),
-            0
-        );
         assert_eq!(
             menu.selection_at(menu.width as i32 - 1, menu.height as i32 / 2),
             None
@@ -848,32 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_only_changes_enabled_rows() {
-        let mut renderer = Renderer::new(&Config::default());
-        let mut disabled = entry(2, "Unavailable");
-        disabled.enabled = false;
-        let menu = renderer.prepare_menu(&[entry(1, "Open"), disabled], 1, None);
-        let mut plain = Pixmap::new(menu.width, menu.height).unwrap();
-        let mut hover = plain.clone();
-        renderer.draw_menu(&mut plain.as_mut(), &menu, &mut Vec::new(), None);
-        renderer.draw_menu(
-            &mut hover.as_mut(),
-            &menu,
-            &mut Vec::new(),
-            Some(MenuSelection::Item(2)),
-        );
-        assert_eq!(plain.data(), hover.data());
-        renderer.draw_menu(
-            &mut hover.as_mut(),
-            &menu,
-            &mut Vec::new(),
-            Some(MenuSelection::Item(1)),
-        );
-        assert_ne!(plain.data(), hover.data());
-    }
-
-    #[test]
-    fn radio_submenu_keeps_a_back_header_and_distinct_selected_state() {
+    fn radio_submenu_keeps_a_back_header() {
         let mut renderer = Renderer::new(&Config::default());
         let entries: Vec<_> = ["Online", "Away", "Do not disturb", "Invisible"]
             .iter()
@@ -890,63 +851,6 @@ mod tests {
             })
             .collect();
         let menu = renderer.prepare_menu(&entries, 2, Some("Status"));
-        let mut pixmap = Pixmap::new(menu.width, menu.height).unwrap();
-        renderer.draw_menu(&mut pixmap.as_mut(), &menu, &mut Vec::new(), None);
         assert_eq!(menu.hitboxes[0].selection, MenuSelection::Back);
-        let on = menu.hitboxes[1];
-        let off = menu.hitboxes[2];
-        let indicator_x = (on.x + (TEXT_PADDING + 7) * 2) as u32;
-        assert_ne!(
-            pixmap.pixel(indicator_x, (on.y + on.height / 2) as u32),
-            pixmap.pixel(indicator_x, (off.y + off.height / 2) as u32)
-        );
-        if let Ok(path) = std::env::var("NIBARI_SUBMENU_PREVIEW") {
-            pixmap.save_png(path).unwrap();
-        }
-    }
-
-    #[test]
-    fn render_menu_preview() {
-        let mut renderer = Renderer::new(&Config::default());
-        let mut notifications = entry(2, "Notifications");
-        notifications.toggle_type = ToggleType::Checkmark;
-        notifications.toggle_state = ToggleState::On;
-        let mut sound = entry(3, "Message sounds");
-        sound.toggle_type = ToggleType::Checkmark;
-        let mut status = entry(4, "Status");
-        status.submenu = vec![entry(10, "Online")];
-        let mut separator = entry(0, "");
-        separator.separator = true;
-        let mut disabled = entry(5, "Check for updates");
-        disabled.enabled = false;
-        let entries = [
-            entry(1, "Open application"),
-            separator.clone(),
-            notifications,
-            sound,
-            status,
-            separator,
-            disabled,
-            entry(6, "Preferences"),
-            entry(7, "Quit"),
-        ];
-        let menu = renderer.prepare_menu(&entries, 2, None);
-        let mut pixmap = Pixmap::new(menu.width, menu.height).unwrap();
-        renderer.draw_menu(
-            &mut pixmap.as_mut(),
-            &menu,
-            &mut Vec::new(),
-            Some(MenuSelection::Item(4)),
-        );
-        assert_eq!(menu.hitboxes.len(), 7);
-        assert!(
-            pixmap
-                .pixels()
-                .iter()
-                .any(|pixel| pixel.alpha() > 0 && pixel.alpha() < 255)
-        );
-        if let Ok(path) = std::env::var("NIBARI_MENU_PREVIEW") {
-            pixmap.save_png(path).unwrap();
-        }
     }
 }

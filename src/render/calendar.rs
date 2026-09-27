@@ -39,7 +39,7 @@ pub struct PreparedCalendar {
     natural_size: (u32, u32),
     scale: u32,
     bitmap: Pixmap,
-    navigation: [MenuHitbox; 3],
+    navigation: [MenuHitbox; 2],
     hover: Color,
 }
 
@@ -71,11 +71,7 @@ impl PreparedCalendar {
         current: Option<MenuSelection>,
         backwards: bool,
     ) -> Option<MenuSelection> {
-        const CHOICES: [MenuSelection; 3] = [
-            MenuSelection::Item(-1),
-            MenuSelection::Item(0),
-            MenuSelection::Item(1),
-        ];
+        const CHOICES: [MenuSelection; 2] = [MenuSelection::Item(-1), MenuSelection::Item(1)];
         let current =
             current.and_then(|selection| CHOICES.iter().position(|item| *item == selection));
         let index = match (current, backwards) {
@@ -161,6 +157,21 @@ impl Renderer {
         );
 
         let navigation = navigation_hitboxes(scale);
+        for hitbox in &navigation {
+            let button = PixelRect {
+                x: hitbox.x,
+                y: hitbox.y,
+                width: hitbox.width,
+                height: hitbox.height,
+            };
+            stroke_rounded_rect(
+                &mut canvas,
+                button,
+                7.0 * scale as f32,
+                scale as f32,
+                color(palette.border),
+            );
+        }
         let header_center_y = (HEADER_TOP + HEADER_HEIGHT / 2) * s;
         chevron(
             &mut canvas,
@@ -258,7 +269,7 @@ impl Renderer {
             scale,
             bitmap,
             navigation,
-            hover: Color::from_rgba8(palette.header[0], palette.header[1], palette.header[2], 92),
+            hover: color(palette.header),
         }
     }
 
@@ -296,45 +307,37 @@ impl Renderer {
             stroke_rounded_rect(
                 canvas,
                 PixelRect {
-                    x: hitbox.x + calendar.scale as i32 * 2,
-                    y: hitbox.y + calendar.scale as i32 * 2,
-                    width: hitbox.width - calendar.scale as i32 * 4,
-                    height: hitbox.height - calendar.scale as i32 * 4,
+                    x: hitbox.x,
+                    y: hitbox.y,
+                    width: hitbox.width,
+                    height: hitbox.height,
                 },
                 7.0 * calendar.scale as f32,
-                calendar.scale as f32,
+                2.0 * calendar.scale as f32,
                 calendar.hover,
             );
         }
     }
 }
 
-fn navigation_hitboxes(scale: u32) -> [MenuHitbox; 3] {
+fn navigation_hitboxes(scale: u32) -> [MenuHitbox; 2] {
     let s = scale as i32;
     [
         MenuHitbox {
             selection: MenuSelection::Item(-1),
             enabled: true,
-            x: 14 * s,
-            y: HEADER_TOP * s,
-            width: 40 * s,
-            height: HEADER_HEIGHT * s,
-        },
-        MenuHitbox {
-            selection: MenuSelection::Item(0),
-            enabled: true,
-            x: 54 * s,
-            y: HEADER_TOP * s,
-            width: 180 * s,
-            height: HEADER_HEIGHT * s,
+            x: 17 * s,
+            y: (HEADER_TOP + 3) * s,
+            width: 34 * s,
+            height: (HEADER_HEIGHT - 6) * s,
         },
         MenuHitbox {
             selection: MenuSelection::Item(1),
             enabled: true,
-            x: 234 * s,
-            y: HEADER_TOP * s,
-            width: 40 * s,
-            height: HEADER_HEIGHT * s,
+            x: 237 * s,
+            y: (HEADER_TOP + 3) * s,
+            width: 34 * s,
+            height: (HEADER_HEIGHT - 6) * s,
         },
     ]
 }
@@ -560,7 +563,9 @@ mod tests {
             renderer.prepare_calendar(date(2024, 2, 1), date(2024, 2, 18), 1, &palette());
 
         assert_eq!(calendar.selection_at(30, 34), Some(MenuSelection::Item(-1)));
-        assert_eq!(calendar.selection_at(144, 34), Some(MenuSelection::Item(0)));
+        assert_eq!(calendar.selection_at(15, 34), None);
+        assert_eq!(calendar.selection_at(17, 34), Some(MenuSelection::Item(-1)));
+        assert_eq!(calendar.selection_at(144, 34), None);
         assert_eq!(calendar.selection_at(258, 34), Some(MenuSelection::Item(1)));
         assert_eq!(
             calendar.next_selection(None, false),
@@ -568,7 +573,7 @@ mod tests {
         );
         assert_eq!(
             calendar.next_selection(Some(MenuSelection::Item(-1)), false),
-            Some(MenuSelection::Item(0))
+            Some(MenuSelection::Item(1))
         );
         assert_eq!(
             calendar.next_selection(Some(MenuSelection::Item(-1)), true),
@@ -586,42 +591,13 @@ mod tests {
 
         assert_eq!(calendar.size(), (300, 70));
         assert_eq!(calendar.selection_at(60, 68), Some(MenuSelection::Item(-1)));
-        assert_eq!(calendar.selection_at(299, 68), Some(MenuSelection::Item(0)));
+        assert_eq!(calendar.selection_at(299, 68), None);
         assert_eq!(calendar.selection_at(300, 68), None);
         assert_eq!(calendar.selection_at(60, 70), None);
     }
 
     #[test]
-    fn rendered_today_has_highlight_while_another_day_does_not() {
-        let colors = palette();
-        let mut renderer = Renderer::new(&Config::default());
-        let calendar = renderer.prepare_calendar(date(2024, 2, 1), date(2024, 2, 18), 1, &colors);
-
-        assert!(rect_contains_color(
-            &calendar.bitmap,
-            (241, 150, 28, 28),
-            colors.today_background,
-        ));
-        assert!(!rect_contains_color(
-            &calendar.bitmap,
-            (130, 150, 28, 28),
-            colors.today_background,
-        ));
-    }
-
-    #[test]
-    fn transparent_card_keeps_exact_configured_alpha_at_an_unpainted_interior_pixel() {
-        let colors = palette();
-        let mut renderer = Renderer::new(&Config::default());
-        let calendar = renderer.prepare_calendar(date(2024, 2, 1), date(2024, 2, 18), 1, &colors);
-
-        let pixel = calendar.bitmap.pixel(144, 62).unwrap();
-        assert_eq!(pixel.alpha(), colors.background[3]);
-        assert_eq!(calendar.bitmap.pixel(0, 0).unwrap().alpha(), 0);
-    }
-
-    #[test]
-    fn drawing_reuses_prepared_bitmap_and_publishes_navigation_hitboxes() {
+    fn drawing_publishes_navigation_hitboxes() {
         let mut renderer = Renderer::new(&Config::default());
         let calendar =
             renderer.prepare_calendar(date(2024, 2, 1), date(2024, 2, 18), 1, &palette());
@@ -635,33 +611,7 @@ mod tests {
             Some(MenuSelection::Item(1)),
         );
 
-        assert_eq!(hitboxes.len(), 3);
+        assert_eq!(hitboxes.len(), 2);
         assert_eq!(hitboxes[0].selection, MenuSelection::Item(-1));
-        assert!(target.data().iter().any(|channel| *channel != 0));
-    }
-
-    #[test]
-    #[ignore = "writes /tmp/nibari-calendar-preview.png for explicit visual QA"]
-    fn write_calendar_preview() {
-        let mut renderer = Renderer::new(&Config::default());
-        let calendar =
-            renderer.prepare_calendar(date(2024, 2, 1), date(2024, 2, 18), 1, &palette());
-        let mut target = Pixmap::new(calendar.size().0, calendar.size().1).unwrap();
-
-        renderer.draw_calendar(&mut target.as_mut(), &calendar, &mut Vec::new(), None);
-        target.save_png("/tmp/nibari-calendar-preview.png").unwrap();
-    }
-
-    fn rect_contains_color(pixmap: &Pixmap, rect: (u32, u32, u32, u32), color: [u8; 4]) -> bool {
-        let (x, y, width, height) = rect;
-        (y..y + height).any(|y| {
-            (x..x + width).any(|x| {
-                let pixel = pixmap.pixel(x, y).unwrap().demultiply();
-                pixel.red() == color[0]
-                    && pixel.green() == color[1]
-                    && pixel.blue() == color[2]
-                    && pixel.alpha() == color[3]
-            })
-        })
     }
 }

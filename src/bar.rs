@@ -56,6 +56,7 @@ use wayland_client::{
 
 use crate::{
     bluetooth::{BluetoothHandle, PromptKind, Snapshot as BluetoothSnapshot},
+    clipboard::{self, History as ClipboardHistory},
     config::Config,
     media::{MediaHandle, MediaSnapshot},
     memory::{self, TrimSchedule},
@@ -64,6 +65,7 @@ use crate::{
         self, FocusCommand, NiriEvent, NiriHandle, NiriModel, SurfaceContent,
         WORKSPACES_PER_OUTPUT, WindowTask, WorkspaceSlot,
     },
+    power::{self, Action as PowerAction},
     render::{
         HitTarget, Hitbox, MenuHitbox, MenuSelection, PreparedPopup, RenderContent, Renderer,
         bluetooth::{Page as BluetoothPage, UiAction as BluetoothUiAction},
@@ -86,6 +88,8 @@ pub fn run(config: Config) -> Result<()> {
     let connection = Connection::connect_to_env().context("failed to connect to Wayland")?;
     let (globals, event_queue) =
         registry_queue_init(&connection).context("failed to obtain Wayland globals")?;
+    let (clipboard_events, clipboard_channel) = channel::channel();
+    clipboard::spawn(clipboard_events);
     let queue_handle = event_queue.handle();
 
     let compositor = CompositorState::bind(&globals, &queue_handle)
@@ -118,7 +122,8 @@ pub fn run(config: Config) -> Result<()> {
     let tray = TrayHandle::spawn(tray_events, &config);
     let (media_events, media_channel) = channel::channel();
     let media = config
-        .media.enabled
+        .media
+        .enabled
         .then(|| MediaHandle::spawn(media_events, &config));
     let (niri_events, niri_channel) = channel::channel();
     let niri = niri::spawn(niri_events, &config);
@@ -141,7 +146,8 @@ pub fn run(config: Config) -> Result<()> {
     };
     let network_palette = NetworkPalette::from(&config);
     let network_target = config
-        .network.ping_target
+        .network
+        .ping_target
         .parse()
         .expect("validated network target");
     let (network_events, network_channel) = channel::channel();
@@ -177,6 +183,7 @@ pub fn run(config: Config) -> Result<()> {
         None
     };
 
+    let clipboard_history = ClipboardHistory::new(config.clipboard.max_items);
     let mut app = App {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &queue_handle),
@@ -203,6 +210,7 @@ pub fn run(config: Config) -> Result<()> {
         bluetooth_visible: false,
         bluetooth_page: BluetoothPage::Root,
         bluetooth_input: String::new(),
+        clipboard_history,
         renderer,
         background_opaque,
         bars_hidden: false,
@@ -276,6 +284,21 @@ pub fn run(config: Config) -> Result<()> {
             })
             .map_err(|error| anyhow::anyhow!("failed to attach Bluetooth events: {error}"))?;
     }
+
+    event_loop
+        .handle()
+        .insert_source(clipboard_channel, |event, _, app| {
+            if let ChannelEvent::Msg(entry) = event
+                && app.clipboard_history.push(entry)
+                && app
+                    .menu_surface
+                    .as_ref()
+                    .is_some_and(|menu| menu.prepared.is_clipboard())
+            {
+                app.update_menu_page();
+            }
+        })
+        .map_err(|error| anyhow::anyhow!("failed to attach clipboard events: {error}"))?;
 
     if app.media.is_some() {
         event_loop
@@ -491,6 +514,7 @@ struct App {
     bluetooth_visible: bool,
     bluetooth_page: BluetoothPage,
     bluetooth_input: String,
+    clipboard_history: ClipboardHistory,
     renderer: Renderer,
     background_opaque: bool,
     bars_hidden: bool,
@@ -1018,6 +1042,36 @@ impl App {
         self.show_popup(target, seat, serial, prepared, None);
     }
 
+    fn show_clipboard(&mut self, x: i32, y: i32) {
+        let Some(target) = self.menu_target(x, y) else {
+            return;
+        };
+        let Some((seat, serial, _, _)) = self.pending_menu_grab.take() else {
+            return;
+        };
+        let prepared = PreparedPopup::Clipboard(
+            self.renderer
+                .prepare_clipboard_menu(&self.clipboard_history, target.scale),
+        );
+        self.show_popup(target, seat, serial, prepared, None);
+    }
+
+    fn show_power(&mut self, x: i32, y: i32) {
+        if !self.config.power.enabled {
+            return;
+        }
+        let Some(target) = self.menu_target(x, y) else {
+            return;
+        };
+        let Some((seat, serial, _, _)) = self.pending_menu_grab.take() else {
+            return;
+        };
+        let entries = power::menu_entries(&self.config.power);
+        let prepared =
+            PreparedPopup::Power(self.renderer.prepare_power_menu(&entries, target.scale));
+        self.show_popup(target, seat, serial, prepared, None);
+    }
+
     fn update_network_popup(&mut self) {
         let Some(menu) = self
             .menu_surface
@@ -1088,13 +1142,12 @@ impl App {
             bounded_dimension(buffer_width.div_ceil(target.scale), target.logical_width);
         let logical_height =
             bounded_dimension(buffer_height.div_ceil(target.scale), target.logical_height);
-        let left = popup_left(
-            target.local_x,
-            logical_width,
-            target.logical_width,
-            prepared.centered(),
+        let left = popup_left(target.anchor_x, logical_width, target.logical_width);
+        let top = menu_top(
+            self.config.bar.height,
+            logical_height,
+            target.logical_height,
         );
-        let top = menu_top(self.config.bar.height, logical_height, target.logical_height);
 
         self.menu_surface = None;
 
@@ -1166,7 +1219,7 @@ impl App {
             calendar_scroll: 0.0,
             selected: None,
             pointer_position: None,
-            anchor_x: target.local_x,
+            anchor_x: target.anchor_x,
             output_width: target.logical_width,
             output_height: target.logical_height,
             reposition_token: 1,
@@ -1198,7 +1251,7 @@ impl App {
                         scale: surface.scale,
                         logical_width: surface.logical_width,
                         logical_height: surface.output_size.1,
-                        local_x,
+                        anchor_x: menu_anchor_x(&surface.hitboxes, surface.scale, local_x, local_y),
                     })
             })
             .or_else(|| {
@@ -1211,7 +1264,7 @@ impl App {
                         scale: surface.scale,
                         logical_width: surface.logical_width,
                         logical_height: surface.output_size.1,
-                        local_x: x - surface.output_position.0,
+                        anchor_x: x - surface.output_position.0,
                     })
             })
     }
@@ -1228,6 +1281,14 @@ impl App {
                 menu.scale,
                 menu.output_width,
             ))
+        } else if menu.prepared.is_clipboard() {
+            PreparedPopup::Clipboard(
+                self.renderer
+                    .prepare_clipboard_menu(&self.clipboard_history, menu.scale),
+            )
+        } else if menu.prepared.is_power() {
+            let entries = power::menu_entries(&self.config.power);
+            PreparedPopup::Power(self.renderer.prepare_power_menu(&entries, menu.scale))
         } else if menu.prepared.is_weather() {
             PreparedPopup::Weather(self.renderer.prepare_weather(
                 &self.weather_state,
@@ -1266,12 +1327,7 @@ impl App {
         let logical_width = bounded_dimension(buffer_width.div_ceil(menu.scale), menu.output_width);
         let logical_height =
             bounded_dimension(buffer_height.div_ceil(menu.scale), menu.output_height);
-        let left = popup_left(
-            menu.anchor_x,
-            logical_width,
-            menu.output_width,
-            menu.prepared.centered(),
-        );
+        let left = popup_left(menu.anchor_x, logical_width, menu.output_width);
         let top = menu_top(self.config.bar.height, logical_height, menu.output_height);
 
         menu.logical_width = logical_width;
@@ -1348,6 +1404,44 @@ impl App {
     }
 
     fn apply_menu_action(&mut self, action: MenuInputAction) {
+        if self
+            .menu_surface
+            .as_ref()
+            .is_some_and(|menu| menu.prepared.is_power())
+        {
+            match action {
+                MenuInputAction::Activate(id) => {
+                    let command = PowerAction::from_id(id).and_then(|action| {
+                        let command = action.command(&self.config.power);
+                        (!command.trim().is_empty()).then(|| (action, command.to_owned()))
+                    });
+                    self.menu_surface = None;
+                    if let Some((action, command)) = command {
+                        power::execute(action, command);
+                    }
+                }
+                MenuInputAction::Dismiss | MenuInputAction::Back => self.menu_surface = None,
+                _ => {}
+            }
+            return;
+        }
+        if self
+            .menu_surface
+            .as_ref()
+            .is_some_and(|menu| menu.prepared.is_clipboard())
+        {
+            match action {
+                MenuInputAction::Activate(id) => {
+                    if let Some(entry) = self.clipboard_history.get(id) {
+                        clipboard::copy(entry);
+                    }
+                    self.menu_surface = None;
+                }
+                MenuInputAction::Dismiss | MenuInputAction::Back => self.menu_surface = None,
+                _ => {}
+            }
+            return;
+        }
         if self
             .menu_surface
             .as_ref()
@@ -1638,6 +1732,26 @@ impl App {
                 let global_y = bar.output_position.1 + y.round() as i32;
                 self.show_network(global_x, global_y);
             }
+            Some(HitTarget::Power) if button == BTN_LEFT => {
+                let icon = bar
+                    .hitboxes
+                    .iter()
+                    .find(|hit| hit.target == HitTarget::Power)
+                    .expect("power hitbox exists");
+                let global_x = bar.output_position.0 + (icon.x + icon.width / 2) / bar.scale as i32;
+                let global_y = bar.output_position.1 + y.round() as i32;
+                self.show_power(global_x, global_y);
+            }
+            Some(HitTarget::Clipboard) if button == BTN_LEFT => {
+                let icon = bar
+                    .hitboxes
+                    .iter()
+                    .find(|hit| hit.target == HitTarget::Clipboard)
+                    .expect("clipboard hitbox exists");
+                let global_x = bar.output_position.0 + (icon.x + icon.width / 2) / bar.scale as i32;
+                let global_y = bar.output_position.1 + y.round() as i32;
+                self.show_clipboard(global_x, global_y);
+            }
             Some(HitTarget::Clock) if button == BTN_LEFT => {
                 let clock = bar
                     .hitboxes
@@ -1676,7 +1790,7 @@ struct MenuTarget {
     scale: u32,
     logical_width: u32,
     logical_height: u32,
-    local_x: i32,
+    anchor_x: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1707,13 +1821,26 @@ fn menu_input_action(
     }
 }
 
-fn popup_left(anchor: i32, width: u32, output_width: u32, centered: bool) -> i32 {
-    let left = if centered {
-        anchor - width as i32 / 2
-    } else {
-        anchor
-    };
-    left.clamp(0, output_width.saturating_sub(width) as i32)
+fn menu_anchor_x(hitboxes: &[Hitbox], scale: u32, local_x: i32, local_y: i32) -> i32 {
+    hit_target_at(hitboxes, scale, local_x as f64, local_y as f64)
+        .and_then(|target| {
+            let anchor = if target == HitTarget::Weather {
+                HitTarget::Clock
+            } else {
+                target
+            };
+            hitboxes
+                .iter()
+                .find(|hitbox| hitbox.target == anchor)
+                .or_else(|| hitboxes.iter().find(|hitbox| hitbox.target == target))
+        })
+        .map_or(local_x, |hitbox| {
+            (hitbox.x + hitbox.width / 2) / scale.max(1) as i32
+        })
+}
+
+fn popup_left(anchor: i32, width: u32, output_width: u32) -> i32 {
+    (anchor - width as i32 / 2).clamp(0, output_width.saturating_sub(width) as i32)
 }
 
 fn bounded_dimension(preferred: u32, output_bound: u32) -> u32 {
@@ -2626,12 +2753,57 @@ fn preferred_shm_format(formats: &[wl_shm::Format]) -> wl_shm::Format {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn calendar_popup_is_centered_under_clock_and_clamped_to_output() {
-        assert_eq!(popup_left(960, 288, 1920, true), 816);
-        assert_eq!(popup_left(20, 288, 1920, true), 0);
-        assert_eq!(popup_left(1900, 288, 1920, true), 1632);
-        assert_eq!(popup_left(960, 288, 1920, false), 960);
-        assert_eq!(popup_left(100, 288, 200, true), 0);
+    fn popup_card_centers_on_its_control_and_keeps_the_window_gap() {
+        let width = 288;
+        let left = popup_left(960, width, 1920);
+        assert_eq!(left + width as i32 / 2, 960);
+        assert_eq!(popup_left(1900, width, 1920) + width as i32 - 8, 1912);
+        assert_eq!(menu_top(24, 280, 1080) + 8, 32);
+    }
+
+    #[test]
+    fn popups_clamp_to_output_without_losing_their_anchor() {
+        assert_eq!(popup_left(960, 288, 1920), 816);
+        assert_eq!(popup_left(20, 288, 1920), 0);
+        assert_eq!(popup_left(1900, 288, 1920), 1632);
+        assert_eq!(popup_left(100, 288, 200), 0);
+    }
+
+    #[test]
+    fn tray_popup_anchors_to_icon_center_when_clicked_near_its_edge() {
+        let hitboxes = [Hitbox {
+            target: HitTarget::Tray(0),
+            x: 200,
+            y: 0,
+            width: 32,
+            height: 48,
+        }];
+        assert_eq!(menu_anchor_x(&hitboxes, 2, 101, 12), 108);
+        assert_eq!(popup_left(108, 80, 960), 68);
+    }
+
+    #[test]
+    fn weather_popup_uses_the_calendar_anchor() {
+        let hitboxes = [
+            Hitbox {
+                target: HitTarget::Clock,
+                x: 400,
+                y: 0,
+                width: 100,
+                height: 24,
+            },
+            Hitbox {
+                target: HitTarget::Weather,
+                x: 550,
+                y: 0,
+                width: 20,
+                height: 24,
+            },
+        ];
+        let calendar_anchor = menu_anchor_x(&hitboxes, 1, 450, 12);
+        let weather_anchor = menu_anchor_x(&hitboxes, 1, 560, 12);
+        assert_eq!(weather_anchor, calendar_anchor);
+        assert_eq!(menu_anchor_x(&hitboxes[1..], 1, 560, 12), 560);
     }
 
     #[test]
@@ -2736,10 +2908,13 @@ mod tests {
                     expected.swap(0, 2);
                 }
                 assert_eq!(&canvas[400 * 4..401 * 4], &expected);
-                assert_eq!(hitboxes.len(), WORKSPACES_PER_OUTPUT + 1);
+                assert_eq!(hitboxes.len(), WORKSPACES_PER_OUTPUT + 3);
                 assert!(hitboxes.iter().all(|hitbox| matches!(
                     hitbox.target,
-                    HitTarget::Workspace { .. } | HitTarget::Clock
+                    HitTarget::Workspace { .. }
+                        | HitTarget::Clock
+                        | HitTarget::Clipboard
+                        | HitTarget::Power
                 )));
                 if rgba[3] < 255 {
                     // Antialiased glyphs need not have fully opaque pixels.

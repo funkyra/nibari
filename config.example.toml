@@ -4,7 +4,7 @@
 # Colors use #RRGGBB or #RRGGBBAA.
 height = 24
 font_family = "Fira Code Retina"
-font_size = 12.5
+font_size = 12
 background = "#211B1BD8"
 foreground = "#FFF2E3FF"
 icon_foreground = "#FFF2E3FF"
@@ -12,7 +12,9 @@ icon_muted = "#D5BCADFF"
 padding = 4
 
 [workspaces]
-width = 24
+width = 20
+# Size of the crisp pixel-drawn workspace labels; clock and tasks stay unchanged.
+font_size = 16
 focused_background = "#211B1B00"
 active_background = "#211B1B00"
 active_foreground = "#FFB66EFF"
@@ -22,8 +24,10 @@ urgent_foreground = "#FF9C83FF"
 
 [tasks]
 enabled = true
-icon_size = 18
+icon_size = 16
 spacing = 8
+# Total gap between the final task button and the clock area.
+clock_spacing = 14
 padding = 6
 background = "#211B1B00"
 focused_background = "#211B1B00"
@@ -35,6 +39,7 @@ focused_foreground = "#FFB66EFF"
 enabled = true
 
 [tray]
+# Also sets the size of the weather, Bluetooth, clipboard, and network icons.
 icon_size = 16
 spacing = 6
 drawer = true
@@ -90,12 +95,23 @@ border = "#976A5AFF"
 [network]
 enabled = true
 interface = ""
-ping_target = "1.1.1.1"
+ping_target = "8.8.8.8"
 background = "#211B1BFA"
 foreground = "#FFF2E3FF"
 muted = "#D5BCADFF"
 accent = "#FFB66EFF"
 border = "#976A5AFF"
+
+[clipboard]
+max_items = 5
+
+[power]
+enabled = true
+# Commands run through sh -c. An empty command disables that menu item.
+shutdown = "loginctl poweroff"
+restart = "loginctl reboot"
+suspend = "loginctl suspend"
+hibernate = "loginctl hibernate"
 
 [icons]
 # theme = "Papirus"

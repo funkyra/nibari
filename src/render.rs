@@ -3,13 +3,18 @@ use std::{collections::HashMap, path::PathBuf, process::Command};
 use cosmic_text::{
     Align, Attrs, Buffer, Color as TextColor, Family, FontSystem, Metrics, Shaping, SwashCache,
 };
-use tiny_skia::{Color, Paint, PathBuilder, Pixmap, PixmapMut, Rect, Stroke, Transform};
+use tiny_skia::{Color, Paint, Path, PathBuilder, Pixmap, PixmapMut, Rect, Stroke, Transform};
 
 pub mod bluetooth;
 pub mod calendar;
+mod clipboard;
 pub mod network;
+mod pixel_icons;
 mod popup;
+mod popup_chrome;
+mod power;
 pub mod weather;
+mod workspace_glyphs;
 pub use popup::PreparedPopup;
 mod menu;
 pub use menu::{MenuHitbox, MenuSelection, PreparedMenu};
@@ -18,12 +23,10 @@ use crate::{
     config::{ClockPosition, Config},
     media::MediaSnapshot,
     network::NetworkKind,
-    niri::{WORKSPACE_LABELS, WORKSPACES_PER_OUTPUT, WindowTask, WorkspaceSlot},
+    niri::{WORKSPACES_PER_OUTPUT, WindowTask, WorkspaceSlot},
     tray::TrayIcon,
     weather::Condition,
 };
-
-const TASK_CLOCK_GAP: i32 = 12;
 
 fn font_path(output: &str) -> Option<PathBuf> {
     output
@@ -109,6 +112,8 @@ pub enum HitTarget {
     TrayDrawer,
     Clock,
     Network,
+    Power,
+    Clipboard,
     Bluetooth,
     Weather,
 }
@@ -152,6 +157,7 @@ pub struct RenderContent<'a> {
 struct Style {
     font_family: Box<str>,
     font_size: f32,
+    workspace_font_size: f32,
     background: Color,
     foreground: [u8; 4],
     menu_background: Color,
@@ -169,6 +175,7 @@ struct Style {
     weather_foreground: [u8; 4],
     bluetooth_enabled: bool,
     network_enabled: bool,
+    power_enabled: bool,
     network_foreground: [u8; 4],
     network_muted: [u8; 4],
     workspace_width: u32,
@@ -181,6 +188,7 @@ struct Style {
     media_enabled: bool,
     task_icon_size: u32,
     task_spacing: u32,
+    task_clock_spacing: u32,
     task_padding: u32,
     task_background: Color,
     task_focused_background: Color,
@@ -196,7 +204,9 @@ struct BarLayout {
     clock_y: i32,
     keyboard_x: i32,
     bluetooth_x: Option<i32>,
+    clipboard_x: i32,
     network_x: Option<i32>,
+    power_x: Option<i32>,
     weather_x: Option<i32>,
     keyboard_y: i32,
     keyboard_width: i32,
@@ -249,8 +259,11 @@ impl BarLayout {
             keyboard_anchor - spacing - keyboard_width
         };
 
+        let end_anchor = right_anchor - if centered { 0 } else { spacing };
+        let power_x = style.power_enabled.then_some(end_anchor - icon_size);
+        let status_anchor = power_x.map_or(end_anchor, |x| x - spacing);
         let network_x = style.network_enabled.then(|| {
-            let x = right_anchor - if centered { 0 } else { spacing } - icon_size;
+            let x = status_anchor - icon_size;
             keyboard_x = x - if keyboard_width > 0 {
                 spacing + keyboard_width
             } else {
@@ -264,10 +277,21 @@ impl BarLayout {
                 };
             x
         });
+        let clipboard_x = network_x.map_or(status_anchor, |x| x - spacing) - icon_size;
+        keyboard_x = clipboard_x
+            - if keyboard_width > 0 {
+                spacing + keyboard_width
+            } else {
+                0
+            };
+        tray_left = keyboard_x
+            - if tray_len > 0 {
+                spacing + tray_width
+            } else {
+                0
+            };
         let bluetooth_x = style.bluetooth_enabled.then(|| {
-            let x = network_x.map_or(right_anchor - if centered { 0 } else { spacing }, |x| {
-                x - spacing
-            }) - icon_size;
+            let x = clipboard_x - spacing - icon_size;
             keyboard_x = x - if keyboard_width > 0 {
                 spacing + keyboard_width
             } else {
@@ -283,8 +307,10 @@ impl BarLayout {
         });
         Self {
             bluetooth_x,
+            clipboard_x,
             weather_x: style.weather_enabled.then_some(clock_x + clock.0 + spacing),
             network_x,
+            power_x,
             clock_x,
             clock_y: (canvas.1 - clock.1) / 2,
             keyboard_x,
@@ -315,6 +341,7 @@ impl BarLayout {
 struct ClockBitmap {
     text: String,
     pixmap: Pixmap,
+    reserved_width: u32,
 }
 
 struct TextBitmap {
@@ -368,6 +395,7 @@ struct TaskIconBitmap {
     scale: u32,
     revision: u64,
     pixels: Vec<u8>,
+    visible_rows: (i32, i32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -440,9 +468,12 @@ pub struct Renderer {
     bluetooth_icon_cache: Vec<(u32, Pixmap)>,
     network_kind: NetworkKind,
     network_icon_cache: Vec<(u32, Pixmap)>,
+    clipboard_icon_cache: Vec<(u32, Pixmap)>,
+    power_icon_cache: Vec<(u32, Pixmap)>,
     icon_cache: Vec<IconBitmap>,
     workspace_cache: Vec<WorkspaceBitmap>,
     task_text_cache: Vec<TaskTextBitmap>,
+    task_text_y: HashMap<u32, i32>,
     task_icon_cache: Vec<TaskIconBitmap>,
     media_cache: Vec<MediaBitmap>,
 }
@@ -458,6 +489,7 @@ impl Renderer {
             style: Style {
                 font_family: config.bar.font_family.clone().into_boxed_str(),
                 font_size: config.bar.font_size,
+                workspace_font_size: config.workspaces.font_size.unwrap_or(config.bar.font_size),
                 background: Color::from_rgba8(
                     background[0],
                     background[1],
@@ -480,6 +512,7 @@ impl Renderer {
                 weather_foreground: config.color_rgba(&config.bar.icon_foreground),
                 bluetooth_enabled: config.bluetooth.enabled,
                 network_enabled: config.network.enabled,
+                power_enabled: config.power.enabled,
                 network_foreground: config.color_rgba(&config.bar.icon_foreground),
                 network_muted: config.color_rgba(&config.bar.icon_muted),
                 workspace_width: config.workspaces.width,
@@ -499,6 +532,10 @@ impl Renderer {
                 media_enabled: config.media.enabled,
                 task_icon_size: config.tasks.icon_size,
                 task_spacing: config.tasks.spacing,
+                task_clock_spacing: config
+                    .tasks
+                    .clock_spacing
+                    .unwrap_or(config.tasks.spacing.saturating_add(config.tray.spacing)),
                 task_padding: config.tasks.padding,
                 task_background: rgba(config.color_rgba(&config.tasks.background)),
                 task_focused_background: rgba(config.color_rgba(&config.tasks.focused_background)),
@@ -517,9 +554,12 @@ impl Renderer {
             bluetooth_icon_cache: Vec::new(),
             network_kind: NetworkKind::Offline,
             network_icon_cache: Vec::new(),
+            clipboard_icon_cache: Vec::new(),
+            power_icon_cache: Vec::new(),
             icon_cache: Vec::new(),
             workspace_cache: Vec::new(),
             task_text_cache: Vec::new(),
+            task_text_y: HashMap::new(),
             task_icon_cache: Vec::new(),
             media_cache: Vec::new(),
         }
@@ -582,8 +622,8 @@ impl Renderer {
         self.cache_clock(clock, scale);
         self.cache_keyboard_layout(keyboard_layout, scale);
         let clock_size = {
-            let cached = &self.clock_cache[&scale].pixmap;
-            (cached.width() as i32, cached.height() as i32)
+            let cached = &self.clock_cache[&scale];
+            (cached.reserved_width as i32, cached.pixmap.height() as i32)
         };
         let keyboard_size = self.keyboard_cache.as_ref().map_or((0, 0), |cached| {
             (cached.reserved_width as i32, cached.pixmap.height() as i32)
@@ -619,13 +659,6 @@ impl Renderer {
 
         // Keep the drawer at the right edge when the clock is centered.
         let drawer_handle = (self.style.tray_drawer && !tray.is_empty()).then(|| {
-            if layout.network_x.is_none() && layout.bluetooth_x.is_none() {
-                layout.keyboard_x = if layout.keyboard_width > 0 {
-                    right_anchor - layout.spacing - layout.keyboard_width
-                } else {
-                    right_anchor
-                };
-            }
             let handle = layout.keyboard_x - layout.spacing - layout.icon_size;
             let full_width =
                 layout.icon_size * tray.len() as i32 + layout.spacing * tray.len() as i32;
@@ -656,6 +689,7 @@ impl Renderer {
         if let Some(x) = layout.network_x {
             right_content_left = right_content_left.min(x);
         }
+        right_content_left = right_content_left.min(layout.clipboard_x);
         let workspace_right = if centered {
             workspace_right
         } else {
@@ -679,7 +713,7 @@ impl Renderer {
         let cached_clock = &self.clock_cache[&scale].pixmap;
         draw_premultiplied(
             pixmap,
-            layout.clock_x,
+            layout.clock_x + (clock_size.0 - cached_clock.width() as i32) / 2,
             layout.clock_y,
             cached_clock.width(),
             cached_clock.height(),
@@ -791,6 +825,83 @@ impl Renderer {
                 );
                 hitboxes.push(Hitbox {
                     target: HitTarget::Network,
+                    x: visible_left,
+                    y: 0,
+                    width: visible_right - visible_left,
+                    height: pixmap.height() as i32,
+                });
+            }
+        }
+        if let Some(x) = layout.power_x {
+            let visible_left = x.max(right_min);
+            let visible_right = (x + layout.icon_size).min(pixmap.width() as i32);
+            if visible_right > visible_left {
+                let size = layout.icon_size as u32;
+                let index = self
+                    .power_icon_cache
+                    .iter()
+                    .position(|(cached_size, _)| *cached_size == size)
+                    .unwrap_or_else(|| {
+                        self.power_icon_cache
+                            .push((size, power::icon(size, self.style.network_foreground)));
+                        self.power_icon_cache.len() - 1
+                    });
+                let icon = &self.power_icon_cache[index].1;
+                draw_premultiplied_clipped(
+                    pixmap,
+                    x,
+                    layout.icon_y,
+                    size,
+                    size,
+                    icon.data(),
+                    PixelRect {
+                        x: visible_left,
+                        y: 0,
+                        width: visible_right - visible_left,
+                        height: pixmap.height() as i32,
+                    },
+                );
+                hitboxes.push(Hitbox {
+                    target: HitTarget::Power,
+                    x: visible_left,
+                    y: 0,
+                    width: visible_right - visible_left,
+                    height: pixmap.height() as i32,
+                });
+            }
+        }
+        {
+            let x = layout.clipboard_x;
+            let visible_left = x.max(right_min);
+            let visible_right = (x + layout.icon_size).min(pixmap.width() as i32);
+            if visible_right > visible_left {
+                let size = layout.icon_size as u32;
+                let index = self
+                    .clipboard_icon_cache
+                    .iter()
+                    .position(|(cached_size, _)| *cached_size == size)
+                    .unwrap_or_else(|| {
+                        self.clipboard_icon_cache
+                            .push((size, clipboard::icon(size, self.style.network_foreground)));
+                        self.clipboard_icon_cache.len() - 1
+                    });
+                let icon = &self.clipboard_icon_cache[index].1;
+                draw_premultiplied_clipped(
+                    pixmap,
+                    x,
+                    layout.icon_y,
+                    size,
+                    size,
+                    icon.data(),
+                    PixelRect {
+                        x: visible_left,
+                        y: 0,
+                        width: visible_right - visible_left,
+                        height: pixmap.height() as i32,
+                    },
+                );
+                hitboxes.push(Hitbox {
+                    target: HitTarget::Clipboard,
                     x: visible_left,
                     y: 0,
                     width: visible_right - visible_left,
@@ -969,15 +1080,22 @@ impl Renderer {
             .get(&scale)
             .is_none_or(|cached| cached.text != text);
         if stale {
-            let bitmap = self.rasterize_clock(text, scale);
+            let previous_width = self
+                .clock_cache
+                .get(&scale)
+                .map_or(0, |cached| cached.reserved_width);
+            let mut bitmap = self.rasterize_clock(text, scale);
+            bitmap.reserved_width = bitmap.pixmap.width().max(previous_width);
             self.clock_cache.insert(scale, bitmap);
         }
     }
 
     fn rasterize_clock(&mut self, text: &str, scale: u32) -> ClockBitmap {
+        let pixmap = self.rasterize_text(text, scale, self.style.foreground);
         ClockBitmap {
             text: text.to_owned(),
-            pixmap: self.rasterize_text(text, scale, self.style.foreground),
+            reserved_width: pixmap.width(),
+            pixmap,
         }
     }
 
@@ -1154,21 +1272,11 @@ impl Renderer {
             .iter()
             .position(|cached| cached.key == key)
             .unwrap_or_else(|| {
-                let label = if index == 0 {
-                    "●"
+                let pixmap = if index == 0 {
+                    self.rasterize_text("●", scale, color)
                 } else {
-                    WORKSPACE_LABELS[index as usize - 1]
+                    workspace_glyphs::glyph(index, self.style.workspace_font_size, scale, color)
                 };
-                let mut pixmap = self.rasterize_text(label, scale, color);
-                if index != 0 && !has_visible_pixels(&pixmap) {
-                    const FALLBACK_LABELS: [&str; 10] =
-                        ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
-                    pixmap = self.rasterize_text(
-                        FALLBACK_LABELS[index.saturating_sub(1) as usize],
-                        scale,
-                        color,
-                    );
-                }
                 self.workspace_cache.push(WorkspaceBitmap { key, pixmap });
                 self.workspace_cache.len() - 1
             })
@@ -1189,10 +1297,8 @@ impl Renderer {
         let scale_i32 = scale as i32;
         let left = self.style.workspace_width as i32 * workspace_count as i32 * scale_i32;
         let separator_gap = self.style.task_spacing as i32 * scale_i32;
-        let leading_gap = separator_gap * scale_i32;
-        let right = bar.clock_x
-            - bar.spacing
-            - (self.style.task_spacing as i32 + TASK_CLOCK_GAP) * scale_i32;
+        let leading_gap = separator_gap;
+        let right = bar.clock_x - self.style.task_clock_spacing as i32 * scale_i32;
         let Some(layout) = TaskLayout::calculate(
             left + leading_gap,
             right,
@@ -1204,6 +1310,7 @@ impl Renderer {
         };
         let separator_height = (pixmap.height() as i32 / 2).max(scale_i32);
         let separator_y = (pixmap.height() as i32 - separator_height) / 2;
+        let text_y = self.task_text_y(scale, pixmap.height() as i32);
         if leading_gap >= scale_i32 {
             fill_rect(
                 pixmap,
@@ -1214,19 +1321,6 @@ impl Renderer {
                 self.style.task_separator,
             );
         }
-
-        let edge_label_width = if tasks.len() > 1 {
-            let first = &tasks[0];
-            let first_index =
-                self.ensure_task_label(first, scale, task_foreground(&self.style, first));
-            let first_width = self.task_text_cache[first_index].natural_width;
-            let last = &tasks[tasks.len() - 1];
-            let last_index =
-                self.ensure_task_label(last, scale, task_foreground(&self.style, last));
-            Some(first_width.min(self.task_text_cache[last_index].natural_width))
-        } else {
-            None
-        };
 
         tasks.iter().enumerate().for_each(|(index, task)| {
             let Some(rect) = layout.item(index) else {
@@ -1261,15 +1355,11 @@ impl Renderer {
             let padding = self.style.task_padding as i32 * scale_i32;
             let icon_size = (self.style.task_icon_size * scale) as i32;
             let color = task_foreground(&self.style, task);
-            let width_limit = edge_label_width.filter(|_| index == 0 || index + 1 == tasks.len());
+            let label_capacity = (rect.width - padding * 3 - icon_size).max(0);
+            let width_limit = (label_capacity > 0).then_some(label_capacity as u32);
             let label_index = self.cached_task_label(task, scale, color, width_limit);
-            let natural_label_width = self.task_text_cache[label_index].pixmap.width() as i32;
-            let inner_width = (rect.width - padding * 2).max(0);
-            let visible_label_width = if inner_width >= icon_size + padding {
-                natural_label_width.min(inner_width - icon_size - padding)
-            } else {
-                0
-            };
+            let visible_label_width =
+                (self.task_text_cache[label_index].pixmap.width() as i32).min(label_capacity);
             let content_width = icon_size
                 + if visible_label_width > 0 {
                     padding + visible_label_width
@@ -1277,8 +1367,9 @@ impl Renderer {
                     0
                 };
             let icon_x = rect.x + (rect.width - content_width) / 2;
-            let icon_y = (rect.height - icon_size) / 2;
             let icon_index = self.cached_task_icon(task, scale, icon_size as u32);
+            let (icon_top, icon_height) = self.task_icon_cache[icon_index].visible_rows;
+            let icon_y = (rect.height - icon_height) / 2 - icon_top;
             draw_premultiplied_clipped(
                 pixmap,
                 icon_x,
@@ -1294,7 +1385,7 @@ impl Renderer {
             draw_premultiplied_clipped(
                 pixmap,
                 label_x,
-                (rect.height - label.height() as i32) / 2,
+                text_y,
                 label.width(),
                 label.height(),
                 label.data(),
@@ -1319,10 +1410,10 @@ impl Renderer {
         });
         if let Some(last) = layout.item(tasks.len() - 1) {
             let gap = bar.clock_x - last.x - last.width;
-            if gap >= scale_i32 {
+            if separator_gap >= scale_i32 && gap >= separator_gap {
                 fill_rect(
                     pixmap,
-                    last.x + last.width + gap / 2 - scale_i32 / 2,
+                    last.x + last.width + separator_gap / 2 - scale_i32 / 2,
                     separator_y,
                     scale_i32,
                     separator_height,
@@ -1516,12 +1607,15 @@ impl Renderer {
         {
             if self.task_icon_cache[index].revision != task.icon.revision {
                 self.task_icon_cache[index].revision = task.icon.revision;
-                self.task_icon_cache[index].pixels = scale_pixels(
+                let pixels = scale_pixels(
                     &task.icon.pixels,
                     task.icon.width,
                     task.icon.height,
                     target_size,
                 );
+                self.task_icon_cache[index].visible_rows =
+                    visible_rows(&pixels, target_size, target_size);
+                self.task_icon_cache[index].pixels = pixels;
             }
             return index;
         }
@@ -1532,14 +1626,27 @@ impl Renderer {
             task.icon.height,
             target_size,
         );
+        let visible_rows = visible_rows(&pixels, target_size, target_size);
         trim_cache(&mut self.task_icon_cache);
         self.task_icon_cache.push(TaskIconBitmap {
             id: task.id,
             scale,
             revision: task.icon.revision,
             pixels,
+            visible_rows,
         });
         self.task_icon_cache.len() - 1
+    }
+
+    fn task_text_y(&mut self, scale: u32, bar_height: i32) -> i32 {
+        if let Some(y) = self.task_text_y.get(&scale) {
+            return *y;
+        }
+        let sample = self.rasterize_text("Hgjp", scale, self.style.task_foreground);
+        let (top, height) = visible_rows(sample.data(), sample.width(), sample.height());
+        let y = (bar_height - height) / 2 - top;
+        self.task_text_y.insert(scale, y);
+        y
     }
 
     fn cached_icon(&mut self, icon: &TrayIcon, scale: u32, target_size: u32) -> usize {
@@ -1565,12 +1672,36 @@ impl Renderer {
     }
 }
 
-fn has_visible_pixels(pixmap: &Pixmap) -> bool {
-    pixmap.data().chunks_exact(4).any(|pixel| pixel[3] != 0)
+fn visible_rows(pixels: &[u8], width: u32, height: u32) -> (i32, i32) {
+    let mut first = height;
+    let mut last = 0;
+    for (y, row) in pixels.chunks_exact(width as usize * 4).enumerate() {
+        if row.chunks_exact(4).any(|pixel| pixel[3] != 0) {
+            first = first.min(y as u32);
+            last = y as u32 + 1;
+        }
+    }
+    if first == height {
+        (0, height as i32)
+    } else {
+        (first as i32, (last - first) as i32)
+    }
 }
 
 fn rgba(color: [u8; 4]) -> Color {
     Color::from_rgba8(color[0], color[1], color[2], color[3])
+}
+
+fn fitted_icon_transform(path: &Path, size: u32, stroke_width: f32) -> Transform {
+    let bounds = path.bounds();
+    let padding = stroke_width / 2.0;
+    let width = bounds.width() + stroke_width;
+    let height = bounds.height() + stroke_width;
+    let scale = (size as f32 - 1.0).max(1.0) / width.max(height);
+    Transform::from_scale(scale, scale).post_translate(
+        (size as f32 - width * scale) / 2.0 - (bounds.left() - padding) * scale,
+        (size as f32 - height * scale) / 2.0 - (bounds.top() - padding) * scale,
+    )
 }
 
 fn workspace_background(style: &Style, workspace: WorkspaceSlot) -> Option<Color> {
@@ -1584,8 +1715,8 @@ fn workspace_background(style: &Style, workspace: WorkspaceSlot) -> Option<Color
 fn workspace_foreground(style: &Style, workspace: WorkspaceSlot) -> [u8; 4] {
     match (
         workspace.is_urgent,
-        workspace.is_focused || workspace.is_active,
-        workspace.is_occupied,
+        workspace.is_focused,
+        workspace.is_active || workspace.is_occupied,
     ) {
         (true, _, _) => style.workspace_urgent_foreground,
         (false, true, _) => style.workspace_active_foreground,
@@ -1824,6 +1955,75 @@ fn blend_premultiplied(target: &mut [u8], source: &[u8]) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn power_button_sits_immediately_right_of_network_and_uses_tray_size() {
+        let config = Config {
+            clock: crate::config::ClockConfig {
+                position: ClockPosition::Center,
+                ..Default::default()
+            },
+            network: crate::config::NetworkConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let renderer = Renderer::new(&config);
+        let layout = BarLayout::calculate((1920, 28), (200, 14), (0, 0), 0, 1, &renderer.style);
+        assert_eq!(
+            layout.power_x.unwrap(),
+            layout.network_x.unwrap() + layout.icon_size + layout.spacing
+        );
+        assert_eq!(
+            layout.power_x.unwrap() + layout.icon_size,
+            1920 - config.bar.padding as i32
+        );
+
+        let disabled = Config {
+            clock: crate::config::ClockConfig {
+                position: ClockPosition::Center,
+                ..Default::default()
+            },
+            network: crate::config::NetworkConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            power: crate::config::PowerConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let renderer = Renderer::new(&disabled);
+        let layout = BarLayout::calculate((1920, 28), (200, 14), (0, 0), 0, 1, &renderer.style);
+        assert_eq!(layout.power_x, None);
+        assert_eq!(
+            layout.network_x.unwrap() + layout.icon_size,
+            1920 - disabled.bar.padding as i32
+        );
+    }
+
+    #[test]
+    fn clipboard_reserves_a_slot_between_bluetooth_and_network() {
+        let config: Config =
+            toml::from_str("[bluetooth]\nenabled = true\n[network]\nenabled = true\n").unwrap();
+        let renderer = Renderer::new(&config);
+        for scale in [1, 2, 3] {
+            let layout = BarLayout::calculate(
+                (1920 * scale as i32, 28 * scale as i32),
+                (200 * scale as i32, 14 * scale as i32),
+                (30 * scale as i32, 14 * scale as i32),
+                0,
+                scale,
+                &renderer.style,
+            );
+            assert_eq!(
+                layout.network_x.unwrap() - layout.bluetooth_x.unwrap(),
+                2 * (layout.icon_size + layout.spacing),
+            );
+        }
+    }
+
+    #[test]
     fn weather_follows_clock_without_changing_its_center() {
         for scale in [1, 2, 3] {
             let s = scale as i32;
@@ -1882,6 +2082,42 @@ mod tests {
     };
 
     #[test]
+    fn clock_region_stays_centered_and_weather_follows_its_edge() {
+        let config = Config {
+            clock: ClockConfig {
+                position: ClockPosition::Center,
+                ..Default::default()
+            },
+            weather: WeatherConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let mut renderer = Renderer::new(&config);
+        renderer.cache_clock("Wednesday September 28, 23:59", 1);
+        let wide = renderer.clock_cache[&1].reserved_width;
+        renderer.cache_clock("Mon Sep 1, 00:00", 1);
+        let clock = &renderer.clock_cache[&1];
+        assert!(clock.pixmap.width() < wide);
+        assert_eq!(clock.reserved_width, wide);
+
+        let layout = BarLayout::calculate(
+            (1920, config.bar.height as i32),
+            (wide as i32, clock.pixmap.height() as i32),
+            (0, 0),
+            0,
+            1,
+            &renderer.style,
+        );
+        assert!((layout.clock_x * 2 + wide as i32 - 1920).abs() <= 1);
+        assert_eq!(
+            layout.weather_x,
+            Some(layout.clock_x + wide as i32 + layout.spacing)
+        );
+    }
+
+    #[test]
     fn centered_clock_uses_canvas_center_independent_of_side_content() {
         let config: Config = toml::from_str("[clock]\nposition = 'center'").unwrap();
         let renderer = Renderer::new(&config);
@@ -1901,7 +2137,7 @@ mod tests {
                     if tray_len > 0 {
                         assert_eq!(
                             layout.icon_x(tray_len - 1) + layout.icon_size,
-                            (1920 - config.bar.padding as i32) * s
+                            layout.keyboard_x - layout.spacing
                         );
                     }
                 }
@@ -2050,15 +2286,16 @@ mod tests {
                     assert_eq!(
                         x,
                         if position == ClockPosition::Center {
-                            1894 * s
+                            1870 * s
                         } else {
-                            1688 * s
+                            1664 * s
                         }
                     );
                     assert_eq!(
                         layout.keyboard_x + layout.keyboard_width + layout.spacing,
-                        x
+                        layout.clipboard_x
                     );
+                    assert_eq!(layout.clipboard_x + layout.icon_size + layout.spacing, x);
                     assert_eq!(
                         layout.clock_x,
                         if position == ClockPosition::Center {
@@ -2204,7 +2441,11 @@ mod tests {
                 let keyboard_width =
                     renderer.keyboard_cache.as_ref().unwrap().reserved_width as i32;
                 assert_eq!(
-                    right + 2 * config.tray.spacing as i32 * scale as i32 + keyboard_width,
+                    right
+                        + 2 * config.tray.spacing as i32 * scale as i32
+                        + keyboard_width
+                        + config.tray.icon_size as i32 * scale as i32
+                        + (config.tray.icon_size + config.tray.spacing) as i32 * scale as i32,
                     (800 - config.bar.padding) as i32 * scale as i32
                 );
                 let task = hitboxes
@@ -2366,6 +2607,7 @@ mod tests {
         let style = Style {
             font_family: "".into(),
             font_size: 13.0,
+            workspace_font_size: 13.0,
             background: Color::BLACK,
             foreground: [255; 4],
             menu_background: Color::BLACK,
@@ -2383,6 +2625,7 @@ mod tests {
             weather_foreground: [220, 220, 204, 255],
             bluetooth_enabled: false,
             network_enabled: false,
+            power_enabled: false,
             network_foreground: [255; 4],
             network_muted: [128; 4],
             workspace_width: 28,
@@ -2395,6 +2638,7 @@ mod tests {
             media_enabled: false,
             task_icon_size: 18,
             task_spacing: 2,
+            task_clock_spacing: 8,
             task_padding: 6,
             task_background: Color::BLACK,
             task_focused_background: Color::BLACK,
@@ -2409,10 +2653,11 @@ mod tests {
     }
 
     #[test]
-    fn layout_places_keyboard_left_of_tray() {
+    fn layout_places_tray_left_of_keyboard_and_clipboard() {
         let style = Style {
             font_family: "".into(),
             font_size: 13.0,
+            workspace_font_size: 13.0,
             background: Color::BLACK,
             foreground: [255; 4],
             menu_background: Color::BLACK,
@@ -2430,6 +2675,7 @@ mod tests {
             weather_foreground: [220, 220, 204, 255],
             bluetooth_enabled: false,
             network_enabled: false,
+            power_enabled: false,
             network_foreground: [255; 4],
             network_muted: [128; 4],
             workspace_width: 28,
@@ -2442,6 +2688,7 @@ mod tests {
             media_enabled: false,
             task_icon_size: 18,
             task_spacing: 2,
+            task_clock_spacing: 8,
             task_padding: 6,
             task_background: Color::BLACK,
             task_focused_background: Color::BLACK,
@@ -2453,10 +2700,13 @@ mod tests {
         let layout = BarLayout::calculate((1920, 28), (130, 17), (18, 13), 2, 1, &style);
 
         assert_eq!(
-            layout.keyboard_x + layout.keyboard_width + layout.spacing,
-            layout.tray_left
+            layout.icon_x(1) + layout.icon_size + layout.spacing,
+            layout.keyboard_x
         );
-        assert!(layout.keyboard_x < layout.tray_left);
+        assert_eq!(
+            layout.keyboard_x + layout.keyboard_width + layout.spacing,
+            layout.clipboard_x
+        );
     }
 
     #[test]
@@ -2483,7 +2733,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_task_labels_use_the_shorter_edge_width() {
+    fn task_labels_respect_their_own_available_width() {
         let config = Config {
             clock: ClockConfig {
                 position: ClockPosition::Center,
@@ -2543,7 +2793,20 @@ mod tests {
                 .width()
         };
         assert!(width(2) > width(1));
-        assert!(width(3) <= width(1));
+        assert!(width(3) > width(1));
+        let last = renderer
+            .task_text_cache
+            .iter()
+            .find(|cached| cached.id == 3)
+            .unwrap();
+        let last_slot = hitboxes
+            .iter()
+            .find(|hitbox| hitbox.target == HitTarget::Window(3))
+            .unwrap();
+        let label_capacity =
+            last_slot.width - (config.tasks.padding * 3 + config.tasks.icon_size) as i32;
+        assert!(last.natural_width <= label_capacity as u32);
+        assert_eq!(last.pixmap.width(), last.natural_width);
     }
 
     #[test]
@@ -2556,6 +2819,7 @@ mod tests {
                 scale,
                 revision: 1,
                 pixels: vec![255; 4],
+                visible_rows: (0, 1),
             });
             renderer.task_text_cache.push(TaskTextBitmap {
                 id,
@@ -2620,7 +2884,8 @@ mod tests {
                 ..Default::default()
             },
             tasks: TasksConfig {
-                spacing: 2,
+                spacing: 8,
+                clock_spacing: Some(13),
                 focused_background: "#123456".into(),
                 enabled: true,
                 ..Default::default()
@@ -2649,43 +2914,53 @@ mod tests {
                 height: 1,
             },
         }];
-        let mut pixmap = Pixmap::new(800, config.bar.height).unwrap();
-        let mut hitboxes = Vec::new();
+        for scale in [1, 2] {
+            let scale_i32 = scale as i32;
+            let mut pixmap = Pixmap::new(800 * scale, config.bar.height * scale).unwrap();
+            let mut hitboxes = Vec::new();
+            renderer.draw(
+                &mut pixmap.as_mut(),
+                RenderContent {
+                    scale,
+                    clock: "Sun Jul 05, 10:42",
+                    keyboard_layout: "",
+                    tray: &[],
+                    tray_reveal: 0.0,
+                    workspaces: &workspaces,
+                    tasks: &tasks,
+                    media: None,
+                },
+                &mut hitboxes,
+            );
 
-        renderer.draw(
-            &mut pixmap.as_mut(),
-            RenderContent {
-                scale: 1,
-                clock: "Sun Jul 05, 10:42",
-                keyboard_layout: "",
-                tray: &[],
-                tray_reveal: 0.0,
-                workspaces: &workspaces,
-                tasks: &tasks,
-                media: None,
-            },
-            &mut hitboxes,
-        );
-
-        let task = hitboxes
-            .iter()
-            .find(|hit| hit.target == HitTarget::Window(1))
-            .unwrap();
-        assert_eq!(
-            task.x,
-            config.workspaces.width as i32 * WORKSPACES_PER_OUTPUT as i32
-                + config.tasks.spacing as i32
-        );
-        assert_eq!(hitboxes.len(), WORKSPACES_PER_OUTPUT + tasks.len() + 1);
-        let clock = hitboxes
-            .iter()
-            .find(|hit| hit.target == HitTarget::Clock)
-            .unwrap();
-        assert!(task.x >= config.workspaces.width as i32 * WORKSPACES_PER_OUTPUT as i32);
-        assert_eq!(
-            clock.x - task.x - task.width,
-            (config.tray.spacing + config.tasks.spacing) as i32 + TASK_CLOCK_GAP
-        );
+            let task = hitboxes
+                .iter()
+                .find(|hit| hit.target == HitTarget::Window(1))
+                .unwrap();
+            assert_eq!(
+                task.x,
+                (config.workspaces.width as i32 * WORKSPACES_PER_OUTPUT as i32
+                    + config.tasks.spacing as i32)
+                    * scale_i32
+            );
+            assert_eq!(hitboxes.len(), WORKSPACES_PER_OUTPUT + tasks.len() + 3);
+            let clock = hitboxes
+                .iter()
+                .find(|hit| hit.target == HitTarget::Clock)
+                .unwrap();
+            assert_eq!(
+                clock.x - task.x - task.width,
+                config.tasks.clock_spacing.unwrap() as i32 * scale_i32
+            );
+            let separator_gap = config.tasks.spacing as i32 * scale_i32;
+            let separator_x = task.x + task.width + separator_gap / 2 - scale_i32 / 2;
+            let middle_y = pixmap.height() as i32 / 2;
+            let pixel_at = |x: i32| {
+                let offset = ((middle_y * pixmap.width() as i32 + x) * 4) as usize;
+                &pixmap.data()[offset..offset + 4]
+            };
+            assert_ne!(pixel_at(separator_x), pixel_at(separator_x + scale_i32));
+        }
     }
 
     #[test]
@@ -2752,7 +3027,7 @@ mod tests {
 
         assert_eq!(
             hitboxes.len(),
-            WORKSPACES_PER_OUTPUT + tasks.len() + tray.len() + 1
+            WORKSPACES_PER_OUTPUT + tasks.len() + tray.len() + 3
         );
         assert_eq!(hitboxes.last().unwrap().target, HitTarget::Tray(0));
     }
@@ -2805,6 +3080,21 @@ mod tests {
             };
             renderer.draw(&mut pixmap.as_mut(), content, &mut hitboxes);
 
+            let power = hitboxes
+                .iter()
+                .find(|hitbox| hitbox.target == HitTarget::Power)
+                .expect("power button has a hitbox");
+            assert_eq!(power.width, config.tray.icon_size as i32 * scale as i32);
+            assert_eq!(
+                hit_target_at(
+                    &hitboxes,
+                    scale,
+                    (power.x + power.width / 2) as f64 / scale as f64,
+                    0.5,
+                ),
+                Some(HitTarget::Power)
+            );
+
             for (offset, workspace) in workspaces.iter().enumerate() {
                 let x = f64::from(config.workspaces.width) * (offset as f64 + 0.5);
                 assert_eq!(
@@ -2846,7 +3136,7 @@ mod tests {
                 },
                 &mut hitboxes,
             );
-            assert_eq!(hitboxes.len(), WORKSPACES_PER_OUTPUT + 1);
+            assert_eq!(hitboxes.len(), WORKSPACES_PER_OUTPUT + 3);
             assert_eq!(hit_target_at(&hitboxes, scale, gap_x - 1.0, 0.5), None);
 
             let mut narrow =
@@ -2886,6 +3176,115 @@ mod tests {
         assert_eq!(renderer.media_cache[0].detail, media.detail);
         renderer.draw_media(&mut canvas.as_mut(), 1, None, 0, 800);
         assert!(renderer.media_cache.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod small_status_icon_tests {
+    use super::*;
+
+    fn alpha_at(icon: &Pixmap, x: u32, y: u32) -> u8 {
+        icon.data()[((y * icon.width() + x) * 4 + 3) as usize]
+    }
+
+    #[test]
+    fn status_icons_at_or_below_16_pixels_have_hard_edges() {
+        for size in [8, 12, 16] {
+            let icons = [
+                bluetooth::icon(size, [255; 4], false),
+                network::network_icon(NetworkKind::Ethernet, size, [255; 4]),
+                clipboard::icon(size, [255; 4]),
+                weather::weather_icon(Condition::Cloudy, false, size, [255; 4]),
+            ];
+            for icon in icons {
+                assert_eq!((icon.width(), icon.height()), (size, size));
+                assert!(icon.data().chunks_exact(4).any(|pixel| pixel[3] == 255));
+                assert!(
+                    icon.data()
+                        .chunks_exact(4)
+                        .all(|pixel| pixel[3] == 0 || pixel[3] == 255),
+                    "soft edge at {size}px"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_16_pixel_status_icons_match_the_selected_shapes() {
+        let bluetooth = bluetooth::icon(16, [255; 4], false);
+        let ethernet = network::network_icon(NetworkKind::Ethernet, 16, [255; 4]);
+        let clipboard = clipboard::icon(16, [255; 4]);
+
+        for y in 1..=14 {
+            assert_eq!(alpha_at(&bluetooth, 8, y), 255);
+        }
+        assert_eq!(alpha_at(&bluetooth, 0, 0), 0);
+        assert_eq!(alpha_at(&ethernet, 2, 2), 255);
+        assert_eq!(alpha_at(&ethernet, 13, 13), 255);
+        assert_eq!(alpha_at(&ethernet, 8, 8), 0);
+        assert_eq!(alpha_at(&clipboard, 7, 1), 255);
+        assert_eq!(alpha_at(&clipboard, 3, 14), 255);
+    }
+
+    #[test]
+    fn small_weather_uses_the_original_pixel_outline() {
+        for condition in [Condition::Cloudy, Condition::Fog] {
+            let icon = weather::weather_icon(condition, false, 16, [255; 4]);
+            assert_eq!(alpha_at(&icon, 8, 8), 0, "{condition:?} is filled");
+            assert_eq!(alpha_at(&icon, 8, 12), 255, "{condition:?} has no base");
+        }
+        let cloud = weather::weather_icon(Condition::Cloudy, false, 16, [255; 4]);
+        assert_eq!(alpha_at(&cloud, 2, 9), 255);
+        assert_eq!(alpha_at(&cloud, 1, 9), 0);
+    }
+
+    #[test]
+    fn status_icons_above_16_pixels_keep_antialiased_vectors() {
+        let size = 17;
+        for icon in [
+            bluetooth::icon(size, [255; 4], false),
+            network::network_icon(NetworkKind::Ethernet, size, [255; 4]),
+            clipboard::icon(size, [255; 4]),
+            weather::weather_icon(Condition::Cloudy, false, size, [255; 4]),
+        ] {
+            assert!(
+                icon.data()
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[3] > 0 && pixel[3] < 255),
+                "expected the existing vector renderer at {size}px"
+            );
+        }
+    }
+
+    #[test]
+    fn every_small_status_state_remains_visible_and_pixel_aligned() {
+        let mut icons = vec![
+            bluetooth::icon(16, [255; 4], true),
+            network::network_icon(NetworkKind::Offline, 16, [255; 4]),
+            network::network_icon(NetworkKind::Wifi, 16, [255; 4]),
+            network::network_icon(NetworkKind::Vpn, 16, [255; 4]),
+        ];
+        for condition in [
+            Condition::Unknown,
+            Condition::Clear,
+            Condition::PartlyCloudy,
+            Condition::Cloudy,
+            Condition::Fog,
+            Condition::Rain,
+            Condition::Snow,
+            Condition::Thunder,
+        ] {
+            icons.push(weather::weather_icon(condition, false, 16, [255; 4]));
+            icons.push(weather::weather_icon(condition, true, 16, [255; 4]));
+        }
+        for icon in icons {
+            assert!(icon.data().chunks_exact(4).any(|pixel| pixel[3] == 255));
+            assert!(
+                icon.data()
+                    .chunks_exact(4)
+                    .all(|pixel| pixel[3] == 0 || pixel[3] == 255)
+            );
+        }
     }
 }
 
@@ -3006,8 +3405,9 @@ mod bluetooth_slot_tests {
                         layout.keyboard_x + layout.keyboard_width + layout.spacing,
                         bt
                     );
+                    assert_eq!(bt + layout.icon_size + layout.spacing, layout.clipboard_x);
                     assert_eq!(
-                        bt + layout.icon_size + layout.spacing,
+                        layout.clipboard_x + layout.icon_size + layout.spacing,
                         layout.network_x.unwrap()
                     );
                     if position == ClockPosition::Center {
@@ -3015,6 +3415,156 @@ mod bluetooth_slot_tests {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_glyph_tests {
+    use super::*;
+
+    #[test]
+    fn active_workspace_without_focus_keeps_white_dot() {
+        let mut config = Config::default();
+        config.workspaces.active_foreground = "#FFB66EFF".into();
+        config.workspaces.occupied_foreground = "#FFF2E3FF".into();
+        let renderer = Renderer::new(&config);
+        let workspace = WorkspaceSlot {
+            is_active: true,
+            is_occupied: true,
+            ..WorkspaceSlot::default()
+        };
+
+        assert_eq!(
+            workspace_foreground(&renderer.style, workspace),
+            [255, 242, 227, 255]
+        );
+        assert_eq!(
+            workspace_foreground(
+                &renderer.style,
+                WorkspaceSlot {
+                    is_occupied: false,
+                    ..workspace
+                }
+            ),
+            [255, 242, 227, 255]
+        );
+        assert_eq!(
+            workspace_foreground(
+                &renderer.style,
+                WorkspaceSlot {
+                    is_focused: true,
+                    ..workspace
+                }
+            ),
+            [255, 182, 110, 255]
+        );
+    }
+
+    #[test]
+    fn workspace_labels_use_crisp_pixels_without_enlarging_other_text() {
+        let config: Config =
+            toml::from_str("[bar]\nfont_size = 12.0\n[workspaces]\nfont_size = 16.0\n").unwrap();
+        let mut renderer = Renderer::new(&config);
+        for workspace in 1..=10 {
+            let index = renderer.cached_workspace_label(workspace, 1, [255; 4]);
+            let glyph = &renderer.workspace_cache[index].pixmap;
+            assert_eq!((glyph.width(), glyph.height()), (16, 16));
+            assert!(glyph.data().chunks_exact(4).any(|pixel| pixel[3] == 255));
+            assert!(
+                glyph
+                    .data()
+                    .chunks_exact(4)
+                    .all(|pixel| pixel[3] == 0 || pixel[3] == 255),
+                "workspace {workspace} has a soft edge"
+            );
+        }
+        assert_eq!(renderer.rasterize_text("四", 1, [255; 4]).height(), 15);
+    }
+
+    #[test]
+    fn workspace_zero_retains_the_inner_strokes_of_kanji() {
+        let config: Config = toml::from_str("[workspaces]\nfont_size = 16.0\n").unwrap();
+        let mut renderer = Renderer::new(&config);
+        let index = renderer.cached_workspace_label(10, 1, [255; 4]);
+        let pixels = renderer.workspace_cache[index].pixmap.data();
+        assert_eq!(pixels[((4 * 16 + 7) * 4 + 3) as usize], 255);
+    }
+}
+
+#[cfg(test)]
+mod popup_corner_tests {
+    use super::*;
+    use crate::{
+        bluetooth::Snapshot as BluetoothSnapshot, config::WeatherUnits, network::NetworkSnapshot,
+        weather::WeatherState,
+    };
+    use chrono::NaiveDate;
+
+    #[test]
+    fn popup_cards_start_at_eight_pixels_and_have_eight_pixel_corners() {
+        let config = Config::default();
+        let mut renderer = Renderer::new(&config);
+        let today = NaiveDate::from_ymd_opt(2024, 2, 18).unwrap();
+        let popups = [
+            (
+                "network",
+                PreparedPopup::Network(renderer.prepare_network(
+                    &NetworkSnapshot::default(),
+                    "1.1.1.1".parse().unwrap(),
+                    1,
+                    &network::NetworkPalette::from(&config),
+                )),
+            ),
+            (
+                "menu",
+                PreparedPopup::Tray(renderer.prepare_menu(&[], 1, None)),
+            ),
+            (
+                "power",
+                PreparedPopup::Power(renderer.prepare_power_menu(&[], 1)),
+            ),
+            (
+                "calendar",
+                PreparedPopup::Calendar(renderer.prepare_calendar(
+                    today,
+                    today,
+                    1,
+                    &calendar::CalendarPalette::from(&config),
+                )),
+            ),
+            (
+                "weather",
+                PreparedPopup::Weather(renderer.prepare_weather(
+                    &WeatherState::default(),
+                    WeatherUnits::Metric,
+                    1,
+                    &weather::WeatherPalette::from(&config),
+                )),
+            ),
+            (
+                "bluetooth",
+                PreparedPopup::Bluetooth(renderer.prepare_bluetooth(
+                    &BluetoothSnapshot::default(),
+                    &bluetooth::Page::Root,
+                    "",
+                    1,
+                    480,
+                )),
+            ),
+        ];
+        for (name, popup) in popups {
+            let (width, height) = popup.size();
+            let mut pixmap = Pixmap::new(width, height).unwrap();
+            renderer.draw_popup(&mut pixmap.as_mut(), &popup, &mut Vec::new(), None);
+            let alpha = |x: u32, y: u32| pixmap.data()[((y * width + x) * 4 + 3) as usize];
+
+            assert_eq!(alpha(width / 2, 7), 0, "{name}: top gap");
+            assert_eq!(alpha(7, height / 2), 0, "{name}: left gap");
+            assert_eq!(alpha(width - 8, height / 2), 0, "{name}: right gap");
+            assert_eq!(alpha(8, 8), 0, "{name}: square corner");
+            assert!(alpha(12, 9) > 32, "{name}: corner radius");
+            assert!(alpha(width / 2, 8) > 32, "{name}: top edge");
         }
     }
 }

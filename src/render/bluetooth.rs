@@ -6,11 +6,11 @@ use super::{MenuHitbox, MenuSelection, PixelRect, Renderer};
 use crate::bluetooth::{Action, Snapshot};
 pub use paint::{Cache, Palette};
 use paint::{Element, Primitive};
-use tiny_skia::{LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke};
 
 const WIDTH: u32 = 480;
 const HEADER: i32 = 60;
-const INSET: i32 = 12;
+const INSET: i32 = super::popup_chrome::CARD_INSET;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Page {
@@ -250,6 +250,13 @@ impl Renderer {
     }
 }
 pub fn icon(size: u32, color: [u8; 4], connected: bool) -> Pixmap {
+    if size <= 16 {
+        return super::pixel_icons::icon(
+            size,
+            color,
+            super::pixel_icons::Shape::Bluetooth { connected },
+        );
+    }
     let mut pixmap = Pixmap::new(size.max(1), size.max(1)).expect("Bluetooth icon");
     let mut path = PathBuilder::new();
     path.move_to(6.0, 6.0);
@@ -272,11 +279,12 @@ pub fn icon(size: u32, color: [u8; 4], connected: bool) -> Pixmap {
         line_join: LineJoin::Round,
         ..Default::default()
     };
+    let path = path.finish().unwrap();
     pixmap.stroke_path(
-        &path.finish().unwrap(),
+        &path,
         &paint,
         &stroke,
-        Transform::from_scale(size as f32 / 24.0, size as f32 / 24.0),
+        super::fitted_icon_transform(&path, size, stroke.width),
         None,
     );
     pixmap

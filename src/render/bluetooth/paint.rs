@@ -182,24 +182,11 @@ impl Renderer {
     ) {
         let s = popup.scale as i32;
         canvas.fill(Color::TRANSPARENT);
-        let rect = PixelRect {
-            x: INSET * s,
-            y: INSET * s,
-            width: popup.width as i32 - 2 * INSET * s,
-            height: popup.height as i32 - 2 * INSET * s,
-        };
-        rounded(canvas, rect, 11.0 * s as f32, popup.palette.border, None);
-        rounded(
+        super::super::popup_chrome::draw_card(
             canvas,
-            PixelRect {
-                x: rect.x + s,
-                y: rect.y + s,
-                width: rect.width - 2 * s,
-                height: rect.height - 2 * s,
-            },
-            10.0 * s as f32,
+            popup.scale,
             popup.palette.background,
-            None,
+            popup.palette.border,
         );
         hitboxes.clear();
         hitboxes.extend_from_slice(&popup.hitboxes);

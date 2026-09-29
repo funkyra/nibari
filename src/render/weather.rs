@@ -8,7 +8,7 @@ use crate::{
 };
 use chrono::Local;
 use tiny_skia::{
-    Color, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapMut, Rect, Stroke, Transform,
+    Color, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapMut, Stroke, Transform,
 };
 
 const WIDTH: u32 = 480;
@@ -79,23 +79,10 @@ impl Renderer {
         let s = scale as i32;
         let mut bitmap = Pixmap::new(WIDTH * scale, HEIGHT * scale).expect("small weather card");
         let mut canvas = bitmap.as_mut();
-        fill_rect(
+        super::popup_chrome::draw_card(
             &mut canvas,
-            6 * s,
-            6 * s,
-            468 * s,
-            190 * s,
+            scale,
             rgba(palette.background),
-        );
-        outline(
-            &mut canvas,
-            PixelRect {
-                x: 6 * s,
-                y: 6 * s,
-                width: 468 * s,
-                height: 190 * s,
-            },
-            scale as f32,
             rgba(palette.border),
         );
         let refresh = MenuHitbox {
@@ -358,22 +345,6 @@ fn rgba(c: [u8; 4]) -> Color {
     Color::from_rgba8(c[0], c[1], c[2], c[3])
 }
 
-fn outline(canvas: &mut PixmapMut<'_>, r: PixelRect, width: f32, color: Color) {
-    if let Some(rect) = Rect::from_xywh(r.x as f32, r.y as f32, r.width as f32, r.height as f32) {
-        let mut paint = Paint::default();
-        paint.set_color(color);
-        canvas.stroke_path(
-            &PathBuilder::from_rect(rect),
-            &paint,
-            &Stroke {
-                width,
-                ..Stroke::default()
-            },
-            Transform::identity(),
-            None,
-        );
-    }
-}
 fn stroke(canvas: &mut PixmapMut<'_>, path: PathBuilder, width: f32, scale: f32, color: Color) {
     if let Some(path) = path.finish() {
         let mut paint = Paint::default();
@@ -411,6 +382,13 @@ fn sun(p: &mut PathBuilder, cx: f32, cy: f32, r: f32, rays: bool) {
     }
 }
 pub(super) fn weather_icon(condition: Condition, night: bool, size: u32, color: [u8; 4]) -> Pixmap {
+    if size <= 16 {
+        return super::pixel_icons::icon(
+            size,
+            color,
+            super::pixel_icons::Shape::Weather { condition, night },
+        );
+    }
     let mut icon = Pixmap::new(size.max(1), size.max(1)).expect("small weather icon");
     let mut p = PathBuilder::new();
     match condition {

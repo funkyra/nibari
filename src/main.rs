@@ -1,5 +1,6 @@
 mod bar;
 mod bluetooth;
+mod clipboard;
 mod config;
 mod control;
 mod icons;
@@ -8,6 +9,7 @@ mod media;
 mod memory;
 mod network;
 mod niri;
+mod power;
 mod render;
 mod single_instance;
 mod tray;

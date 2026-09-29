@@ -17,8 +17,6 @@ use crate::{
     icons::{IconLoader, fallback_icon, image_revision},
 };
 
-pub const WORKSPACE_LABELS: [&str; 10] =
-    ["一", "二", "三", "四", "五", "六", "七", "八", "九", "零"];
 pub const WORKSPACES_PER_OUTPUT: usize = 5;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -262,7 +260,8 @@ pub fn spawn(events: UiSender<NiriEvent>, config: &Config) -> NiriHandle {
 
 fn listen_forever(events: UiSender<NiriEvent>, config: Config) {
     let mut icons = config
-        .tasks.enabled
+        .tasks
+        .enabled
         .then(|| ApplicationIconCache::new(&config));
     loop {
         if let Err(error) = listen(&events, icons.as_mut()) {
@@ -936,14 +935,6 @@ mod tests {
         windows.sort_unstable_by_key(|(id, position)| window_tape_order_key(*id, *position));
 
         assert_eq!(windows.map(|(id, _)| id), [10, 20, 40, 30, 70, 80]);
-    }
-
-    #[test]
-    fn labels_have_requested_order() {
-        assert_eq!(
-            WORKSPACE_LABELS,
-            ["一", "二", "三", "四", "五", "六", "七", "八", "九", "零"]
-        );
     }
 
     #[test]

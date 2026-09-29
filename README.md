@@ -79,6 +79,8 @@ Restart nibari after editing the config.
 The tasklist shows application windows on the active workspace of each monitor.
 Enable it with `tasks.enabled = true` and `clock.position = "center"`; its appearance
 is configured in `[tasks]`. Tasks are hidden by default.
+Set `tasks.clock_spacing` to adjust the gap after the final task; if omitted,
+it defaults to `tasks.spacing + tray.spacing`.
 `tasks.enabled = true` with a right-hand clock is a configuration error. Hiding tasks
 skips application icon and title preparation.
 The icon is searched for first via the application's desktop file, then in the selected icon
@@ -86,6 +88,9 @@ theme; if it is missing, a stable colored placeholder is drawn.
 
 The active workspace on each monitor uses a solid dot (`●`) instead of its label.
 An underline marks any workspace with open windows, including the active one.
+Workspace labels are drawn from crisp 16×16 pixel masks instead of a CJK font. Set
+`workspaces.font_size` to size them independently; if omitted, they use
+`bar.font_size`.
 Set both `workspaces.focused_background` and `workspaces.active_background` to
 `"#00000000"` for a dot without a background highlight.
 
@@ -190,13 +195,15 @@ Weather data and city search come from [Open-Meteo](https://open-meteo.com/)
 
 The independent `[weather]` `background`, `foreground`, `muted`, `accent`, and
 `border` colors support `#RRGGBB` and `#RRGGBBAA`.
-The weather, network, and Bluetooth icons on the bar use `[bar]`
+The weather, network, Bluetooth, and clipboard icons on the bar use `[bar]`
 `icon_foreground` and `icon_muted`, so light popup palettes can use dark text.
+Their size follows `[tray] icon_size`, the same setting as system tray icons;
+`[tasks] icon_size` controls window task icons separately.
 
 ### Bluetooth
 
 Set `bluetooth.enabled = true` to place a Bluetooth icon between the keyboard
-layout and network indicator. Click it to turn adapters on/off, search for devices,
+layout and clipboard icon. Click it to turn adapters on/off, search for devices,
 pair, connect or disconnect. Pairing supports confirmation codes and keyboard
 entry of a PIN/passkey. Search stops after 30 seconds or when the popup closes;
 other applications' discovery sessions are not stopped.
@@ -218,10 +225,26 @@ switch colors are derived from this palette. Device rows offer direct
 connection controls and inline audio profile and codec selectors.
 Use arrows/Tab and Enter to navigate, Left to go back, Escape to close.
 
+### Clipboard history
+
+The clipboard icon sits between Bluetooth and network, or beside whichever of
+those indicators is enabled. Click it to browse recent text and PNG images in
+the panel's own popup. Selecting an entry copies it back to the Wayland
+clipboard. Nibari listens for clipboard changes through Wayland data control
+and keeps the newest five distinct entries in memory by default. The history
+is cleared when nibari exits. Set the limit with:
+
+```toml
+[clipboard]
+max_items = 5
+```
+
+The allowed range is 1–100. Nibari does not poll the clipboard while idle.
+
 ### Network
 
 Set `network.enabled = true` to show a connection icon immediately to the right
-of the keyboard layout (or Bluetooth, when enabled). Click it for connection type, ping, packet loss, current
+of the clipboard icon. Click it for connection type, ping, packet loss, current
 receive/send rates, traffic totals, IP address, and gateway. The refresh button
 updates measurements; Escape, right-click, or clicking outside closes the card.
 
@@ -237,6 +260,22 @@ the icon follows Linux connection events. NetworkManager is not required.
 The card palette is configurable in `[network]` with `background`, `foreground`,
 `muted`, `accent`, and `border`; all accept `#RRGGBBAA`
 opacity. Restart nibari to apply configuration changes.
+
+### Power menu
+
+The power button sits immediately to the right of the network indicator. Click it
+to choose Shutdown, Restart, Suspend, or Hibernate. Set `power.enabled = false`
+to hide the button. Each action runs its configured command through `sh -c`;
+an empty command disables that menu item. For example:
+
+```toml
+[power]
+enabled = true
+shutdown = "systemctl poweroff"
+restart = "systemctl reboot"
+suspend = "systemctl suspend"
+hibernate = "systemctl hibernate"
+```
 
 ### Bar visibility
 

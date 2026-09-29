@@ -8,7 +8,6 @@ use super::{MenuHitbox, MenuSelection, PixelRect, Renderer, draw_premultiplied};
 
 const WIDTH: u32 = 288;
 const HEIGHT: u32 = 280;
-const CARD_INSET: i32 = 6;
 const CONTENT_LEFT: i32 = 15;
 const COLUMN_WIDTH: i32 = 37;
 const HEADER_TOP: i32 = 14;
@@ -136,23 +135,10 @@ impl Renderer {
         bitmap.fill(Color::TRANSPARENT);
         let mut canvas = bitmap.as_mut();
         let s = scale as i32;
-        let card = PixelRect {
-            x: CARD_INSET * s,
-            y: CARD_INSET * s,
-            width: (WIDTH as i32 - 2 * CARD_INSET) * s,
-            height: (HEIGHT as i32 - 2 * CARD_INSET) * s,
-        };
-        rounded_rect(
+        super::popup_chrome::draw_card(
             &mut canvas,
-            card,
-            12.0 * scale as f32,
+            scale,
             color(palette.background),
-        );
-        stroke_rounded_rect(
-            &mut canvas,
-            card,
-            12.0 * scale as f32,
-            scale as f32,
             color(palette.border),
         );
 

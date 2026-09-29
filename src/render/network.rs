@@ -7,9 +7,7 @@ use crate::{
     network::{NetworkKind, NetworkSnapshot},
 };
 use std::net::IpAddr;
-use tiny_skia::{
-    Color, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapMut, Rect, Stroke, Transform,
-};
+use tiny_skia::{Color, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapMut, Stroke};
 
 const WIDTH: u32 = 400;
 const HEIGHT: u32 = 196;
@@ -105,23 +103,10 @@ impl Renderer {
         let height = HEIGHT + extra;
         let mut bitmap = Pixmap::new(WIDTH * scale, height * scale).expect("small network card");
         let mut canvas = bitmap.as_mut();
-        fill_rect(
+        super::popup_chrome::draw_card(
             &mut canvas,
-            6 * s,
-            6 * s,
-            388 * s,
-            (height as i32 - 12) * s,
+            scale,
             rgba(palette.background),
-        );
-        outline(
-            &mut canvas,
-            PixelRect {
-                x: 6 * s,
-                y: 6 * s,
-                width: 388 * s,
-                height: (height as i32 - 12) * s,
-            },
-            scale as f32,
             rgba(palette.border),
         );
         let icon = network_icon(snapshot.kind, 22 * scale, palette.foreground);
@@ -393,26 +378,11 @@ fn rgba(c: [u8; 4]) -> Color {
     Color::from_rgba8(c[0], c[1], c[2], c[3])
 }
 
-fn outline(canvas: &mut PixmapMut<'_>, r: PixelRect, width: f32, color: Color) {
-    if let Some(rect) = Rect::from_xywh(r.x as f32, r.y as f32, r.width as f32, r.height as f32) {
-        let mut paint = Paint::default();
-        paint.set_color(color);
-        canvas.stroke_path(
-            &PathBuilder::from_rect(rect),
-            &paint,
-            &Stroke {
-                width,
-                ..Stroke::default()
-            },
-            Transform::identity(),
-            None,
-        );
-    }
-}
 fn stroke(canvas: &mut PixmapMut<'_>, p: PathBuilder, width: f32, color: Color) {
     if let Some(p) = p.finish() {
         let mut paint = Paint::default();
         paint.set_color(color);
+        let transform = super::fitted_icon_transform(&p, canvas.width(), width);
         canvas.stroke_path(
             &p,
             &paint,
@@ -422,13 +392,16 @@ fn stroke(canvas: &mut PixmapMut<'_>, p: PathBuilder, width: f32, color: Color) 
                 line_join: LineJoin::Round,
                 ..Stroke::default()
             },
-            Transform::identity(),
+            transform,
             None,
         );
     }
 }
 
 pub(super) fn network_icon(kind: NetworkKind, size: u32, color: [u8; 4]) -> Pixmap {
+    if size <= 16 {
+        return super::pixel_icons::icon(size, color, super::pixel_icons::Shape::Network(kind));
+    }
     let mut pixmap = Pixmap::new(size.max(1), size.max(1)).expect("small network icon");
     let s = size as f32 / 18.0;
     let mut p = PathBuilder::new();
@@ -454,22 +427,29 @@ pub(super) fn network_icon(kind: NetworkKind, size: u32, color: [u8; 4]) -> Pixm
             p.line_to(12.0 * s, 6.0 * s);
         }
         NetworkKind::Ethernet | NetworkKind::Offline => {
-            p.move_to(3.0 * s, 2.0 * s);
-            p.line_to(15.0 * s, 2.0 * s);
-            p.line_to(15.0 * s, 14.0 * s);
-            p.line_to(3.0 * s, 14.0 * s);
+            let shape_scale = if kind == NetworkKind::Ethernet {
+                7.0 / 6.0
+            } else {
+                1.0
+            };
+            let x = |value: f32| (9.0 + (value - 9.0) * shape_scale) * s;
+            let y = |value: f32| (8.0 + (value - 8.0) * shape_scale) * s;
+            p.move_to(x(3.0), y(2.0));
+            p.line_to(x(15.0), y(2.0));
+            p.line_to(x(15.0), y(14.0));
+            p.line_to(x(3.0), y(14.0));
             p.close();
-            for x in [6.0, 9.0, 12.0] {
-                p.move_to(x * s, 5.0 * s);
-                p.line_to(x * s, 8.0 * s);
+            for pin_x in [6.0, 9.0, 12.0] {
+                p.move_to(x(pin_x), y(5.0));
+                p.line_to(x(pin_x), y(8.0));
             }
-            p.move_to(7.0 * s, 14.0 * s);
-            p.line_to(7.0 * s, 11.0 * s);
-            p.line_to(11.0 * s, 11.0 * s);
-            p.line_to(11.0 * s, 14.0 * s);
+            p.move_to(x(7.0), y(14.0));
+            p.line_to(x(7.0), y(11.0));
+            p.line_to(x(11.0), y(11.0));
+            p.line_to(x(11.0), y(14.0));
             if kind == NetworkKind::Offline {
-                p.move_to(1.0 * s, 16.0 * s);
-                p.line_to(17.0 * s, 1.0 * s);
+                p.move_to(x(1.0), y(16.0));
+                p.line_to(x(17.0), y(1.0));
             }
         }
     }
@@ -480,6 +460,39 @@ pub(super) fn network_icon(kind: NetworkKind, size: u32, color: [u8; 4]) -> Pixm
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::clipboard;
+
+    fn occupied_rows(pixmap: &Pixmap) -> (usize, usize) {
+        let mut first = None;
+        let mut last = 0;
+        for (y, row) in pixmap
+            .data()
+            .chunks_exact(pixmap.width() as usize * 4)
+            .enumerate()
+        {
+            if row.chunks_exact(4).any(|pixel| pixel[3] != 0) {
+                first.get_or_insert(y);
+                last = y;
+            }
+        }
+        (first.unwrap(), last)
+    }
+
+    #[test]
+    fn ethernet_icon_is_vertically_centered_with_clipboard() {
+        for size in [16, 18, 36, 54] {
+            let ethernet = network_icon(NetworkKind::Ethernet, size, [255; 4]);
+            let clipboard = clipboard::icon(size, [255; 4]);
+            let (top, bottom) = occupied_rows(&ethernet);
+            let (clipboard_top, clipboard_bottom) = occupied_rows(&clipboard);
+            assert_eq!(
+                top + bottom,
+                clipboard_top + clipboard_bottom,
+                "vertical center mismatch at {size}px"
+            );
+        }
+    }
+
     #[test]
     fn traffic_units_distinguish_unknown_from_idle_and_scale_large_totals() {
         assert_eq!(rate(None), "—");

@@ -17,7 +17,8 @@ impl IconLoader {
     pub fn new(config: &Config) -> Self {
         Self {
             theme: config
-                .icons.theme
+                .icons
+                .theme
                 .clone()
                 .or_else(default_theme_gtk)
                 .unwrap_or_else(|| "hicolor".into()),

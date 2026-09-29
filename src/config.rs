@@ -42,6 +42,8 @@ pub struct Config {
     pub weather: WeatherConfig,
     pub bluetooth: BluetoothConfig,
     pub network: NetworkConfig,
+    pub clipboard: ClipboardConfig,
+    pub power: PowerConfig,
     pub icons: IconsConfig,
 }
 
@@ -77,6 +79,7 @@ impl Default for BarConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct WorkspacesConfig {
     pub width: u32,
+    pub font_size: Option<f32>,
     pub focused_background: String,
     pub active_background: String,
     pub active_foreground: String,
@@ -89,6 +92,7 @@ impl Default for WorkspacesConfig {
     fn default() -> Self {
         Self {
             width: 28,
+            font_size: None,
             focused_background: "#3C3836".into(),
             active_background: "#6F6F6F".into(),
             active_foreground: "#F0DFAF".into(),
@@ -105,6 +109,7 @@ pub struct TasksConfig {
     pub enabled: bool,
     pub icon_size: u32,
     pub spacing: u32,
+    pub clock_spacing: Option<u32>,
     pub padding: u32,
     pub background: String,
     pub focused_background: String,
@@ -119,6 +124,7 @@ impl Default for TasksConfig {
             enabled: false,
             icon_size: 18,
             spacing: 2,
+            clock_spacing: None,
             padding: 6,
             background: "#282828".into(),
             focused_background: "#3C3836".into(),
@@ -302,6 +308,40 @@ pub struct NetworkConfig {
     pub border: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClipboardConfig {
+    pub max_items: usize,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self { max_items: 5 }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PowerConfig {
+    pub enabled: bool,
+    pub shutdown: String,
+    pub restart: String,
+    pub suspend: String,
+    pub hibernate: String,
+}
+
+impl Default for PowerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            shutdown: "systemctl poweroff".into(),
+            restart: "systemctl reboot".into(),
+            suspend: "systemctl suspend".into(),
+            hibernate: "systemctl hibernate".into(),
+        }
+    }
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
@@ -394,6 +434,9 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if !(1..=100).contains(&self.clipboard.max_items) {
+            bail!("clipboard.max_items must be in the range 1..=100");
+        }
         if self.tasks.enabled && self.clock.position != ClockPosition::Center {
             bail!("tasks.enabled requires clock.position = 'center'");
         }
@@ -415,11 +458,25 @@ impl Config {
         if !(16..=128).contains(&self.workspaces.width) {
             bail!("workspace_width must be in the range 16..=128");
         }
+        if self
+            .workspaces
+            .font_size
+            .is_some_and(|size| !(6.0..=96.0).contains(&size))
+        {
+            bail!("workspaces.font_size must be in the range 6..=96");
+        }
         if self.tasks.icon_size == 0 || self.tasks.icon_size > self.bar.height {
             bail!("task_icon_size must be greater than 0 and no greater than height");
         }
         if self.tasks.spacing > 256 || self.tasks.padding > 256 {
             bail!("task_spacing and task_padding must be no greater than 256");
+        }
+        if self
+            .tasks
+            .clock_spacing
+            .is_some_and(|spacing| spacing > 512)
+        {
+            bail!("tasks.clock_spacing must be no greater than 512");
         }
         if StrftimeItems::new(&self.clock.format).any(|item| item == Item::Error) {
             bail!("clock_format contains an invalid strftime sequence");
@@ -722,6 +779,34 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn task_clock_spacing_is_configurable() {
+        assert!(toml::from_str::<Config>("[tasks]\nclock_spacing = 13").is_ok());
+        let too_large: Config = toml::from_str("[tasks]\nclock_spacing = 513").unwrap();
+        assert!(too_large.validate().is_err());
+    }
+
+    #[test]
+    fn power_commands_can_be_configured() {
+        let config: Config =
+            toml::from_str("[power]\nshutdown = 'loginctl poweroff'\nrestart = ''\n").unwrap();
+        assert_eq!(config.power.shutdown, "loginctl poweroff");
+        assert!(config.power.restart.is_empty());
+        assert_eq!(config.power.suspend, "systemctl suspend");
+    }
+
+    #[test]
+    fn clipboard_history_limit_is_configurable() {
+        assert!(toml::from_str::<Config>("[clipboard]\nmax_items = 2").is_ok());
+        assert_eq!(Config::default().clipboard.max_items, 5);
+        assert!(
+            toml::from_str::<Config>("[clipboard]\nmax_items = 0")
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
 
     struct TestDirectory(PathBuf);
 

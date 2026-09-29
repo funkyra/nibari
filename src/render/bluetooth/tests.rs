@@ -2,7 +2,42 @@ use super::*;
 use crate::{
     bluetooth::{Adapter, Device, Prompt, PromptKind},
     config::Config,
+    network::NetworkKind,
+    render::network::network_icon,
 };
+
+fn occupied_rows(pixmap: &Pixmap) -> (usize, usize) {
+    let mut first = None;
+    let mut last = 0;
+    for (y, row) in pixmap
+        .data()
+        .chunks_exact(pixmap.width() as usize * 4)
+        .enumerate()
+    {
+        if row.chunks_exact(4).any(|pixel| pixel[3] != 0) {
+            first.get_or_insert(y);
+            last = y;
+        }
+    }
+    (first.unwrap(), last)
+}
+
+#[test]
+fn bluetooth_icon_aligns_vertically_with_network_icon() {
+    for size in [16, 18, 36, 54] {
+        let network = network_icon(NetworkKind::Ethernet, size, [255; 4]);
+        let (network_top, network_bottom) = occupied_rows(&network);
+        for connected in [false, true] {
+            let bluetooth = icon(size, [255; 4], connected);
+            let (top, bottom) = occupied_rows(&bluetooth);
+            assert_eq!(
+                top + bottom,
+                network_top + network_bottom,
+                "misaligned at {size}px, connected={connected}"
+            );
+        }
+    }
+}
 
 fn fixture() -> Snapshot {
     Snapshot {
@@ -23,6 +58,23 @@ fn fixture() -> Snapshot {
         }],
         ..Default::default()
     }
+}
+
+#[test]
+fn bluetooth_card_keeps_configured_background_alpha() {
+    let mut config = Config::default();
+    config.bluetooth.background = "#211B1B80".into();
+    config.bluetooth.border = "#976A5AFF".into();
+    let mut renderer = Renderer::new(&config);
+    let popup = renderer.prepare_bluetooth(&Snapshot::default(), &Page::Root, "", 1, 480);
+    let mut pixmap = Pixmap::new(popup.width, popup.height).unwrap();
+    let mut hitboxes = Vec::new();
+
+    renderer.draw_bluetooth(&mut pixmap.as_mut(), &popup, &mut hitboxes, None);
+
+    let x = popup.width as usize / 2;
+    let y = (INSET + 3) as usize;
+    assert_eq!(pixmap.data()[(y * popup.width as usize + x) * 4 + 3], 128);
 }
 
 #[test]

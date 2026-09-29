@@ -1,13 +1,12 @@
 use system_tray::menu::{ToggleState, ToggleType};
-use tiny_skia::{FillRule, LineCap, LineJoin, PathBuilder, Stroke};
+use tiny_skia::{FillRule, LineCap, LineJoin, Path, PathBuilder, Stroke};
 
 use super::{
-    Color, Paint, PixelRect, Pixmap, PixmapMut, Renderer, Transform, draw_premultiplied_clipped,
-    fill_rect, rgba,
+    Color, Paint, PixelRect, Pixmap, PixmapMut, Renderer, Transform, draw_premultiplied,
+    draw_premultiplied_clipped, fill_rect, rgba,
 };
-use crate::tray::TrayMenuEntry;
+use crate::{clipboard::History, tray::TrayMenuEntry};
 
-const SHADOW: i32 = 12;
 const INSET: i32 = 6;
 const TEXT_PADDING: i32 = 10;
 const INDICATOR_WIDTH: i32 = 24;
@@ -36,7 +35,9 @@ pub struct PreparedMenu {
     content_top: i32,
     scroll_offset: i32,
     scale: u32,
+    card_inset: i32,
     indicator_column: bool,
+    trailing_indicator_width: i32,
     entries: Vec<PreparedMenuEntry>,
     hitboxes: Vec<MenuHitbox>,
     ellipsis: Pixmap,
@@ -53,6 +54,7 @@ struct PreparedMenuEntry {
     toggle_type: ToggleType,
     toggle_state: ToggleState,
     submenu: bool,
+    thumbnail: Option<Pixmap>,
 }
 
 impl PreparedMenu {
@@ -107,7 +109,7 @@ impl PreparedMenu {
     }
 
     fn viewport(&self) -> PixelRect {
-        let inset = (SHADOW + INSET) * self.scale as i32;
+        let inset = (self.card_inset + INSET) * self.scale as i32;
         PixelRect {
             x: inset,
             y: self.content_top,
@@ -117,7 +119,7 @@ impl PreparedMenu {
     }
 
     fn row_rect(&self, entry: &PreparedMenuEntry) -> PixelRect {
-        let inset = (SHADOW + INSET) * self.scale as i32;
+        let inset = (self.card_inset + INSET) * self.scale as i32;
         PixelRect {
             x: inset,
             y: entry.y
@@ -207,15 +209,75 @@ impl Renderer {
         scale: u32,
         title: Option<&str>,
     ) -> PreparedMenu {
+        let trailing_indicator_width = entries
+            .iter()
+            .any(|entry| !entry.submenu.is_empty())
+            .then_some(INDICATOR_WIDTH)
+            .unwrap_or(0);
+        self.prepare_menu_inner(entries, scale, title, false, 80, trailing_indicator_width)
+    }
+
+    pub fn prepare_power_menu(&mut self, entries: &[TrayMenuEntry], scale: u32) -> PreparedMenu {
+        self.prepare_menu_inner(entries, scale, None, false, 100, 0)
+    }
+
+    pub fn prepare_clipboard_menu(&mut self, history: &History, scale: u32) -> PreparedMenu {
+        let entries: Vec<_> = if history.entries.is_empty() {
+            vec![TrayMenuEntry {
+                id: -1,
+                label: "Clipboard history is empty".into(),
+                enabled: false,
+                separator: false,
+                submenu: Vec::new(),
+                toggle_type: ToggleType::CannotBeToggled,
+                toggle_state: ToggleState::Off,
+            }]
+        } else {
+            history
+                .entries
+                .iter()
+                .map(|entry| TrayMenuEntry {
+                    id: entry.id,
+                    label: entry.preview.clone(),
+                    enabled: true,
+                    separator: false,
+                    submenu: Vec::new(),
+                    toggle_type: ToggleType::CannotBeToggled,
+                    toggle_state: ToggleState::Off,
+                })
+                .collect()
+        };
+        let mut menu = self.prepare_menu_inner(&entries, scale, None, true, 220, INDICATOR_WIDTH);
+        for row in &mut menu.entries {
+            if let Some(MenuSelection::Item(id)) = row.selection
+                && let Some(source) = history.get(id).and_then(|entry| entry.thumbnail.as_ref())
+            {
+                row.thumbnail = scaled_thumbnail(source, scale);
+            }
+        }
+        menu
+    }
+
+    fn prepare_menu_inner(
+        &mut self,
+        entries: &[TrayMenuEntry],
+        scale: u32,
+        title: Option<&str>,
+        force_gutter: bool,
+        min_card_width: u32,
+        trailing_indicator_width: i32,
+    ) -> PreparedMenu {
         let scale = scale.max(1);
         let s = scale as i32;
+        let card_inset = super::popup_chrome::CARD_INSET;
         let font_size = self.style.font_size.max(13.0);
         let row_height = ((font_size * 1.25).ceil() as i32 + 14).max(32) * s;
-        let mut y = (SHADOW + INSET) * s;
+        let mut y = (card_inset + INSET) * s;
         let mut rows = Vec::with_capacity(entries.len() + 2);
-        let indicator_column = entries
-            .iter()
-            .any(|entry| entry.toggle_type != ToggleType::CannotBeToggled);
+        let indicator_column = force_gutter
+            || entries
+                .iter()
+                .any(|entry| entry.toggle_type != ToggleType::CannotBeToggled);
 
         if let Some(title) = title {
             rows.push(PreparedMenuEntry {
@@ -227,6 +289,7 @@ impl Renderer {
                 toggle_type: ToggleType::CannotBeToggled,
                 toggle_state: ToggleState::Off,
                 submenu: false,
+                thumbnail: None,
             });
             y += row_height;
             rows.push(separator_row(y, s));
@@ -264,6 +327,7 @@ impl Renderer {
                 toggle_type: entry.toggle_type,
                 toggle_state: entry.toggle_state,
                 submenu: !entry.submenu.is_empty(),
+                thumbnail: None,
             });
             y += row_height;
             has_item = true;
@@ -280,19 +344,20 @@ impl Renderer {
         } else {
             0
         };
-        let chrome = 2 * (INSET + TEXT_PADDING) + gutter + INDICATOR_WIDTH;
-        let card_width = (text_width + chrome as u32 * scale).clamp(220 * scale, 360 * scale);
-        let width = card_width + 2 * SHADOW as u32 * scale;
-        let height = (y + (INSET + SHADOW) * s).max((2 * (SHADOW + INSET) + 16) * s) as u32;
+        let chrome = 2 * (INSET + TEXT_PADDING) + gutter + trailing_indicator_width;
+        let card_width =
+            (text_width + chrome as u32 * scale).clamp(min_card_width * scale, 360 * scale);
+        let width = card_width + 2 * card_inset as u32 * scale;
+        let height = (y + (INSET + card_inset) * s).max((2 * (card_inset + INSET) + 16) * s) as u32;
         let hitboxes = rows
             .iter()
             .filter_map(|row| {
                 row.selection.map(|selection| MenuHitbox {
                     selection,
                     enabled: row.enabled,
-                    x: (SHADOW + INSET) * s,
+                    x: (card_inset + INSET) * s,
                     y: row.y,
-                    width: width as i32 - 2 * (SHADOW + INSET) * s,
+                    width: width as i32 - 2 * (card_inset + INSET) * s,
                     height: row.height,
                 })
             })
@@ -305,7 +370,9 @@ impl Renderer {
             content_top,
             scroll_offset: 0,
             scale,
+            card_inset,
             indicator_column,
+            trailing_indicator_width,
             entries: rows,
             hitboxes,
             ellipsis: self.menu_text("…", scale, self.style.menu_foreground),
@@ -340,38 +407,11 @@ impl Renderer {
         let accent = rgba(self.style.menu_accent);
         let border = self.style.menu_border;
         let hover = mix(background, accent, 0.12);
-        let card = PixelRect {
-            x: SHADOW * s,
-            y: SHADOW * s,
-            width: menu.width as i32 - 2 * SHADOW * s,
-            height: menu.height as i32 - 2 * SHADOW * s,
-        };
         pixmap.fill(Color::TRANSPARENT);
-        for spread in (1..=8).rev() {
-            rounded_rect(
-                pixmap,
-                PixelRect {
-                    x: card.x - spread * s,
-                    y: card.y - spread * s + 2 * s,
-                    width: card.width + 2 * spread * s,
-                    height: card.height + 2 * spread * s,
-                },
-                (10 + spread) as f32 * s as f32,
-                Color::from_rgba8(0, 0, 0, 4),
-            );
-        }
-        rounded_rect(pixmap, card, 10.0 * s as f32, border);
-        rounded_rect(
-            pixmap,
-            PixelRect {
-                x: card.x + s,
-                y: card.y + s,
-                width: card.width - 2 * s,
-                height: card.height - 2 * s,
-            },
-            9.0 * s as f32,
-            background,
-        );
+        let Some(card) = super::popup_chrome::draw_card(pixmap, menu.scale, background, border)
+        else {
+            return;
+        };
 
         hitboxes.clear();
         hitboxes.extend_from_slice(&menu.hitboxes);
@@ -457,6 +497,16 @@ impl Renderer {
                     background,
                 );
             }
+            if let Some(thumbnail) = &entry.thumbnail {
+                draw_premultiplied(
+                    &mut row_canvas,
+                    leading,
+                    center_y - thumbnail.height() as i32 / 2,
+                    thumbnail.width(),
+                    thumbnail.height(),
+                    thumbnail.data(),
+                );
+            }
             if entry.submenu {
                 chevron(
                     &mut row_canvas,
@@ -476,7 +526,9 @@ impl Renderer {
             let clip = PixelRect {
                 x: text_x,
                 y: row.y,
-                width: row.x + row.width - (TEXT_PADDING + INDICATOR_WIDTH) * s - text_x,
+                width: row.x + row.width
+                    - (TEXT_PADDING + menu.trailing_indicator_width) * s
+                    - text_x,
                 height: row.height,
             };
             if let Some(text) = &entry.text {
@@ -525,6 +577,30 @@ impl Renderer {
     }
 }
 
+fn scaled_thumbnail(source: &Pixmap, scale: u32) -> Option<Pixmap> {
+    if scale <= 1 {
+        return Some(source.clone());
+    }
+    let width = source.width() * scale;
+    let height = source.height() * scale;
+    let mut thumbnail = Pixmap::new(width, height)?;
+    thumbnail.draw_pixmap(
+        0,
+        0,
+        source.as_ref(),
+        &tiny_skia::PixmapPaint {
+            quality: tiny_skia::FilterQuality::Bicubic,
+            ..Default::default()
+        },
+        Transform::from_scale(
+            width as f32 / source.width() as f32,
+            height as f32 / source.height() as f32,
+        ),
+        None,
+    );
+    Some(thumbnail)
+}
+
 fn separator_row(y: i32, scale: i32) -> PreparedMenuEntry {
     PreparedMenuEntry {
         selection: None,
@@ -535,6 +611,7 @@ fn separator_row(y: i32, scale: i32) -> PreparedMenuEntry {
         toggle_type: ToggleType::CannotBeToggled,
         toggle_state: ToggleState::Off,
         submenu: false,
+        thumbnail: None,
     }
 }
 
@@ -549,8 +626,23 @@ fn mix(base: Color, tint: Color, amount: f32) -> Color {
 }
 
 fn rounded_rect(pixmap: &mut PixmapMut<'_>, rect: PixelRect, radius: f32, color: Color) {
-    if rect.width <= 0 || rect.height <= 0 {
+    let Some(path) = rounded_path(rect, radius) else {
         return;
+    };
+    let mut paint = Paint::default();
+    paint.set_color(color);
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+}
+
+fn rounded_path(rect: PixelRect, radius: f32) -> Option<Path> {
+    if rect.width <= 0 || rect.height <= 0 {
+        return None;
     }
     let (x, y, w, h) = (
         rect.x as f32,
@@ -578,15 +670,7 @@ fn rounded_rect(pixmap: &mut PixmapMut<'_>, rect: PixelRect, radius: f32, color:
     path.line_to(x, y + r);
     path.cubic_to(x, y + r - control, x + r - control, y, x + r, y);
     path.close();
-    let mut paint = Paint::default();
-    paint.set_color(color);
-    pixmap.fill_path(
-        &path.finish().expect("rounded rectangle path"),
-        &paint,
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
+    path.finish()
 }
 
 fn stroke_points(pixmap: &mut PixmapMut<'_>, points: &[(f32, f32)], scale: i32, color: Color) {
@@ -738,7 +822,24 @@ fn draw_label(pixmap: &mut PixmapMut<'_>, text: &Pixmap, ellipsis: &Pixmap, clip
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::{clipboard::Entry, config::Config};
+
+    #[test]
+    fn menu_card_keeps_configured_background_alpha() {
+        let mut config = Config::default();
+        config.menu.background = "#211B1B80".into();
+        config.menu.border = "#976A5AFF".into();
+        let mut renderer = Renderer::new(&config);
+        let menu = renderer.prepare_menu(&[], 1, None);
+        let mut pixmap = Pixmap::new(menu.width, menu.height).unwrap();
+        let mut hitboxes = Vec::new();
+
+        renderer.draw_menu(&mut pixmap.as_mut(), &menu, &mut hitboxes, None);
+
+        let x = menu.width as usize / 2;
+        let y = (menu.card_inset + 3) as usize;
+        assert_eq!(pixmap.data()[(y * menu.width as usize + x) * 4 + 3], 128);
+    }
 
     fn entry(id: i32, label: &str) -> TrayMenuEntry {
         TrayMenuEntry {
@@ -757,8 +858,8 @@ mod tests {
         let mut renderer = Renderer::new(&Config::default());
         let entries: Vec<_> = (1..=40).map(|id| entry(id, "Menu action")).collect();
         let mut menu = renderer.prepare_menu(&entries, 2, Some("Settings"));
-        menu.constrain(400, 500);
-        assert_eq!(menu.size(), (400, 500));
+        menu.constrain(200, 500);
+        assert_eq!(menu.size(), (200, 500));
         assert!(
             !menu
                 .hitboxes
@@ -819,6 +920,24 @@ mod tests {
     }
 
     #[test]
+    fn tray_menu_width_follows_its_labels_and_submenus() {
+        let mut renderer = Renderer::new(&Config::default());
+        let short_entry = entry(1, "Quit");
+        let narrow = renderer.prepare_menu(std::slice::from_ref(&short_entry), 1, None);
+        assert!(
+            narrow.size().0 < 140,
+            "short tray label left an empty column"
+        );
+        assert_eq!(narrow.trailing_indicator_width, 0);
+
+        let mut with_submenu = short_entry;
+        with_submenu.submenu.push(entry(2, "Child"));
+        let wider = renderer.prepare_menu(&[with_submenu], 1, None);
+        assert_eq!(wider.trailing_indicator_width, INDICATOR_WIDTH);
+        assert!(wider.size().0 > narrow.size().0);
+    }
+
+    #[test]
     fn long_menu_labels_stay_inside_the_card() {
         let mut renderer = Renderer::new(&Config::default());
         let menu = renderer.prepare_menu(
@@ -826,7 +945,10 @@ mod tests {
             2,
             None,
         );
-        assert_eq!(menu.size().0, (360 + 2 * SHADOW as u32) * 2);
+        assert_eq!(
+            menu.size().0,
+            (360 + 2 * super::super::popup_chrome::CARD_INSET as u32) * 2
+        );
         assert_eq!(
             menu.selection_at(menu.width as i32 - 1, menu.height as i32 / 2),
             None
@@ -852,5 +974,29 @@ mod tests {
             .collect();
         let menu = renderer.prepare_menu(&entries, 2, Some("Status"));
         assert_eq!(menu.hitboxes[0].selection, MenuSelection::Back);
+    }
+
+    #[test]
+    fn clipboard_menu_draws_an_image_thumbnail_and_selects_its_entry() {
+        let mut image = Pixmap::new(4, 4).unwrap();
+        image.fill(Color::from_rgba8(255, 0, 0, 255));
+        let mut history = History::new(5);
+        history.push(Entry::png(image.encode_png().unwrap()).unwrap());
+        let mut renderer = Renderer::new(&Config::default());
+        let menu = renderer.prepare_clipboard_menu(&history, 1);
+        let mut canvas = Pixmap::new(menu.width, menu.height).unwrap();
+        let mut hitboxes = Vec::new();
+        renderer.draw_menu(&mut canvas.as_mut(), &menu, &mut hitboxes, None);
+
+        let row = hitboxes[0];
+        assert_eq!(row.selection, MenuSelection::Item(history.entries[0].id));
+        assert_eq!(
+            menu.selection_at(row.x + row.width / 2, row.y + row.height / 2),
+            Some(row.selection)
+        );
+        let x = (row.x + TEXT_PADDING + 11) as usize;
+        let y = (row.y + row.height / 2) as usize;
+        let pixel = &canvas.data()[(y * menu.width as usize + x) * 4..][..4];
+        assert!(pixel[0] > 200 && pixel[1] < 100 && pixel[2] < 100);
     }
 }

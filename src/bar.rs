@@ -11,6 +11,10 @@ use chrono::{
     format::{Fixed, Item, Numeric, StrftimeItems},
 };
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner;
+use smithay_client_toolkit::reexports::protocols_wlr::virtual_pointer::v1::client::{
+    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
+    zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
+};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
     delegate_registry,
@@ -100,6 +104,8 @@ pub fn run(config: Config) -> Result<()> {
         XdgShell::bind(&globals, &queue_handle).context("compositor does not provide xdg-shell")?;
     let shm =
         Shm::bind(&globals, &queue_handle).context("compositor does not provide shared memory")?;
+    let virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1> =
+        globals.bind(&queue_handle, 1..=2, ()).ok();
 
     let mut event_loop: EventLoop<App> =
         EventLoop::try_new().context("failed to create the event loop")?;
@@ -114,6 +120,7 @@ pub fn run(config: Config) -> Result<()> {
         .map_err(|error| {
             anyhow::anyhow!("failed to register signals with the event loop: {error}")
         })?;
+    let wayland_connection = connection.clone();
     WaylandSource::new(connection, event_queue)
         .insert(event_loop.handle())
         .context("failed to attach Wayland to the event loop")?;
@@ -192,6 +199,11 @@ pub fn run(config: Config) -> Result<()> {
         layer_shell,
         xdg_shell,
         shm,
+        virtual_pointer_manager,
+        virtual_pointers: Vec::new(),
+        pending_pointer_restore: None,
+        next_focus_id: 0,
+        wayland_connection,
         queue_handle,
         loop_handle: event_loop.handle(),
         trim_schedule: TrimSchedule::default(),
@@ -351,6 +363,7 @@ pub fn run(config: Config) -> Result<()> {
                         app.renderer.evict_window(window_id);
                         app.schedule_memory_trim();
                     }
+                    NiriEvent::FocusHandled(id) => app.restore_pointer(id),
                 }
             }
         })
@@ -488,6 +501,19 @@ struct AppPointer {
     icon: Option<CursorIcon>,
 }
 
+struct VirtualPointer {
+    seat: wl_seat::WlSeat,
+    pointer: ZwlrVirtualPointerV1,
+}
+
+struct PointerRestore {
+    id: u64,
+    seat: wl_seat::WlSeat,
+    output: wl_output::WlOutput,
+    position: (f64, f64),
+    time: u32,
+}
+
 struct App {
     registry_state: RegistryState,
     output_state: OutputState,
@@ -496,6 +522,11 @@ struct App {
     layer_shell: LayerShell,
     xdg_shell: XdgShell,
     shm: Shm,
+    virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
+    virtual_pointers: Vec<VirtualPointer>,
+    pending_pointer_restore: Option<PointerRestore>,
+    next_focus_id: u64,
+    wayland_connection: Connection,
     queue_handle: QueueHandle<Self>,
     loop_handle: LoopHandle<'static, Self>,
     trim_schedule: TrimSchedule,
@@ -1670,7 +1701,110 @@ impl App {
         }
     }
 
-    fn handle_click(&mut self, surface: &wl_surface::WlSurface, button: u32, x: f64, y: f64) {
+    fn focus_from_bar(
+        &mut self,
+        command: FocusCommand,
+        seat: Option<&wl_seat::WlSeat>,
+        output: wl_output::WlOutput,
+        position: (f64, f64),
+        time: u32,
+    ) {
+        self.pending_pointer_restore = self.virtual_pointer_manager.as_ref().and_then(|_| {
+            let seat = seat?;
+            if !position.0.is_finite() || !position.1.is_finite() {
+                return None;
+            }
+            let id = self.next_focus_id;
+            self.next_focus_id = self.next_focus_id.wrapping_add(1);
+            Some(PointerRestore {
+                id,
+                seat: seat.clone(),
+                output,
+                position,
+                time,
+            })
+        });
+        self.niri.focus(
+            command,
+            self.pending_pointer_restore
+                .as_ref()
+                .map(|restore| restore.id),
+        );
+    }
+
+    fn restore_pointer(&mut self, id: u64) {
+        let Some(restore) = self
+            .pending_pointer_restore
+            .take_if(|restore| restore.id == id)
+        else {
+            return;
+        };
+        let Some(clicked_bar) = self
+            .surfaces
+            .iter()
+            .find(|bar| bar.output == restore.output)
+        else {
+            return;
+        };
+        if !self
+            .pointers
+            .iter()
+            .any(|pointer| pointer.seat == restore.seat)
+        {
+            return;
+        }
+        let Some(bounds) = global_output_bounds(
+            self.surfaces
+                .iter()
+                .map(|bar| (bar.output_position, bar.output_size)),
+        ) else {
+            return;
+        };
+        let global_position = (
+            f64::from(clicked_bar.output_position.0) + restore.position.0,
+            f64::from(clicked_bar.output_position.1) + restore.position.1,
+        );
+        let Some((x, y, width, height)) = pointer_restore_coordinates(global_position, bounds)
+        else {
+            return;
+        };
+
+        let pointer_index = if let Some(index) = self
+            .virtual_pointers
+            .iter()
+            .position(|pointer| pointer.seat == restore.seat)
+        {
+            index
+        } else {
+            let Some(manager) = self.virtual_pointer_manager.as_ref() else {
+                return;
+            };
+            let pointer =
+                manager.create_virtual_pointer(Some(&restore.seat), &self.queue_handle, ());
+            self.virtual_pointers.push(VirtualPointer {
+                seat: restore.seat,
+                pointer,
+            });
+            self.virtual_pointers.len() - 1
+        };
+        self.virtual_pointers[pointer_index]
+            .pointer
+            .motion_absolute(restore.time, x, y, width, height);
+        self.virtual_pointers[pointer_index].pointer.frame();
+        if let Err(error) = self.wayland_connection.flush() {
+            log::warn!("failed to restore pointer after niri focus: {error}");
+        }
+    }
+
+    fn handle_click(
+        &mut self,
+        surface: &wl_surface::WlSurface,
+        button: u32,
+        x: f64,
+        y: f64,
+        seat: Option<&wl_seat::WlSeat>,
+        time: u32,
+    ) {
         if let Some(menu) = self
             .menu_surface
             .as_ref()
@@ -1764,14 +1898,26 @@ impl App {
                 self.show_calendar(global_x, global_y);
             }
             Some(HitTarget::Workspace { id, index }) if button == BTN_LEFT => {
-                self.niri.focus(FocusCommand::Workspace {
-                    id,
-                    index,
-                    output: bar.output_name.clone(),
-                });
+                self.focus_from_bar(
+                    FocusCommand::Workspace {
+                        id,
+                        index,
+                        output: bar.output_name.clone(),
+                    },
+                    seat,
+                    bar.output.clone(),
+                    (x, y),
+                    time,
+                );
             }
             Some(HitTarget::Window(id)) if button == BTN_LEFT => {
-                self.niri.focus(FocusCommand::Window(id));
+                self.focus_from_bar(
+                    FocusCommand::Window(id),
+                    seat,
+                    bar.output.clone(),
+                    (x, y),
+                    time,
+                );
             }
             Some(HitTarget::Tray(index)) => {
                 if let Some(icon) = self.tray_icons.get(index) {
@@ -2218,6 +2364,13 @@ impl OutputHandler for App {
     ) {
         self.menu_surface = None;
         self.surfaces.retain(|surface| surface.output != output);
+        if self
+            .pending_pointer_restore
+            .as_ref()
+            .is_some_and(|restore| restore.output == output)
+        {
+            self.pending_pointer_restore = None;
+        }
         self.assign_workspace_groups();
     }
 }
@@ -2373,6 +2526,21 @@ impl SeatHandler for App {
 
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         self.pointers.retain(|current| current.seat != seat);
+        if self
+            .pending_pointer_restore
+            .as_ref()
+            .is_some_and(|restore| restore.seat == seat)
+        {
+            self.pending_pointer_restore = None;
+        }
+        self.virtual_pointers.retain(|pointer| {
+            if pointer.seat == seat {
+                pointer.pointer.destroy();
+                false
+            } else {
+                true
+            }
+        });
         self.keyboards.retain(|(current, keyboard)| {
             if current == &seat {
                 keyboard.release();
@@ -2622,7 +2790,11 @@ impl PointerHandler for App {
                         }
                     }
                 }
-                PointerEventKind::Press { button, serial, .. } => {
+                PointerEventKind::Press {
+                    button,
+                    serial,
+                    time,
+                } => {
                     self.pending_menu_grab = None;
                     if (button == BTN_RIGHT || button == BTN_LEFT)
                         && self
@@ -2643,7 +2815,19 @@ impl PointerHandler for App {
                             .find(|current| current.themed.pointer() == pointer)
                             .map(|current| (current.seat.clone(), serial, global_x, global_y));
                     }
-                    self.handle_click(&event.surface, button, event.position.0, event.position.1)
+                    let seat = self
+                        .pointers
+                        .iter()
+                        .find(|current| current.themed.pointer() == pointer)
+                        .map(|current| current.seat.clone());
+                    self.handle_click(
+                        &event.surface,
+                        button,
+                        event.position.0,
+                        event.position.1,
+                        seat.as_ref(),
+                        time,
+                    )
                 }
                 _ => {}
             }
@@ -2712,6 +2896,53 @@ impl PointerHandler for App {
 delegate_registry!(App);
 smithay_client_toolkit::delegate_dispatch2!(App);
 delegate_noop!(App: ignore wl_region::WlRegion);
+delegate_noop!(App: ignore ZwlrVirtualPointerManagerV1);
+delegate_noop!(App: ignore ZwlrVirtualPointerV1);
+
+fn global_output_bounds(
+    outputs: impl IntoIterator<Item = ((i32, i32), (u32, u32))>,
+) -> Option<(i32, i32, u32, u32)> {
+    let (min_x, min_y, max_x, max_y) = outputs
+        .into_iter()
+        .filter(|(_, (width, height))| *width != 0 && *height != 0)
+        .map(|((x, y), (width, height))| {
+            (
+                x,
+                y,
+                i64::from(x) + i64::from(width),
+                i64::from(y) + i64::from(height),
+            )
+        })
+        .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))?;
+    Some((
+        min_x,
+        min_y,
+        u32::try_from(max_x - i64::from(min_x)).ok()?,
+        u32::try_from(max_y - i64::from(min_y)).ok()?,
+    ))
+}
+
+fn pointer_restore_coordinates(
+    global_position: (f64, f64),
+    bounds: (i32, i32, u32, u32),
+) -> Option<(u32, u32, u32, u32)> {
+    let (left, top, width, height) = bounds;
+    if width == 0 || height == 0 || !global_position.0.is_finite() || !global_position.1.is_finite()
+    {
+        return None;
+    }
+
+    Some((
+        (global_position.0 - f64::from(left))
+            .round()
+            .clamp(0.0, f64::from(width - 1)) as u32,
+        (global_position.1 - f64::from(top))
+            .round()
+            .clamp(0.0, f64::from(height - 1)) as u32,
+        width,
+        height,
+    ))
+}
 
 fn clock_granularity(format: &str) -> ClockGranularity {
     StrftimeItems::new(format).fold(ClockGranularity::Minute, |current, item| {
@@ -2752,6 +2983,32 @@ fn preferred_shm_format(formats: &[wl_shm::Format]) -> wl_shm::Format {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pointer_restore_uses_global_logical_coordinates() {
+        assert_eq!(
+            pointer_restore_coordinates((75.2, 10.8), (0, 0, 1920, 1080)),
+            Some((75, 11, 1920, 1080)),
+        );
+        assert_eq!(
+            pointer_restore_coordinates((1919.8, -3.0), (0, 0, 1920, 1080)),
+            Some((1919, 0, 1920, 1080)),
+        );
+        assert_eq!(
+            pointer_restore_coordinates((-1844.8, 10.8), (-1920, 0, 3840, 1080)),
+            Some((75, 11, 3840, 1080)),
+        );
+        assert_eq!(
+            pointer_restore_coordinates((4.0, 2.0), (0, 0, 0, 1080)),
+            None
+        );
+    }
+
+    #[test]
+    fn output_bounds_include_monitors_left_of_the_origin() {
+        let outputs = [((-1920, 0), (1920, 1080)), ((0, 0), (1920, 1080))];
+        assert_eq!(global_output_bounds(outputs), Some((-1920, 0, 3840, 1080)));
+    }
+
     #[test]
     fn popup_card_centers_on_its_control_and_keeps_the_window_gap() {
         let width = 288;

@@ -182,6 +182,7 @@ impl WorkspaceModel {
 pub enum NiriEvent {
     State(Arc<NiriModel>),
     WindowClosed(u64),
+    FocusHandled(u64),
 }
 
 pub enum FocusCommand {
@@ -212,12 +213,12 @@ impl FocusCommand {
 }
 
 pub struct NiriHandle {
-    commands: mpsc::Sender<FocusCommand>,
+    commands: mpsc::Sender<(FocusCommand, Option<u64>)>,
 }
 
 impl NiriHandle {
-    pub fn focus(&self, command: FocusCommand) {
-        if let Err(error) = self.commands.send(command) {
+    pub fn focus(&self, command: FocusCommand, restore_id: Option<u64>) {
+        if let Err(error) = self.commands.send((command, restore_id)) {
             log::warn!("failed to queue niri focus command: {error}");
         }
     }
@@ -236,6 +237,7 @@ fn execute_focus(socket: &mut Socket, command: FocusCommand) -> anyhow::Result<(
 
 pub fn spawn(events: UiSender<NiriEvent>, config: &Config) -> NiriHandle {
     let config = config.clone();
+    let action_events = events.clone();
     thread::Builder::new()
         .name("nibari-niri".into())
         .spawn(move || listen_forever(events, config))
@@ -245,12 +247,19 @@ pub fn spawn(events: UiSender<NiriEvent>, config: &Config) -> NiriHandle {
     thread::Builder::new()
         .name("nibari-niri-actions".into())
         .spawn(move || {
-            for command in receiver {
+            for (command, restore_id) in receiver {
                 let result = Socket::connect()
                     .map_err(anyhow::Error::from)
                     .and_then(|mut socket| execute_focus(&mut socket, command));
-                if let Err(error) = result {
-                    log::warn!("niri focus command failed: {error}");
+                match result {
+                    Ok(()) => {
+                        if let Some(id) = restore_id
+                            && let Err(error) = action_events.send(NiriEvent::FocusHandled(id))
+                        {
+                            log::warn!("failed to queue pointer restoration: {error}");
+                        }
+                    }
+                    Err(error) => log::warn!("niri focus command failed: {error}"),
                 }
             }
         })

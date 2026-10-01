@@ -117,8 +117,9 @@ keyboard/Bluetooth/network indicators remain in the right status group. Long con
 clipped within its own side, preserving the clock and tray.
 
 Media comes directly from [MPRIS](https://specifications.freedesktop.org/mpris/latest/Player_Interface.html)
-on the session D-Bus. It shows the artist/channel, a title limited to 32
-characters, elapsed/total time, percentage and playback status, for example:
+on the session D-Bus. It shows the artist/channel and title together in a line
+limited by `media.max_chars` (40 characters by default), then elapsed/total time,
+percentage and playback status, for example:
 
 `AC/DC - Back In Black - 00:31 / 04:16 (12%) [Paused]`
 
@@ -130,7 +131,10 @@ metadata, seeking, player appearance and disappearance are handled through D-Bus
 signals. There is no periodic D-Bus polling. The media line is centered in the
 space available between the clock and the right status group.
 
-Set `media.enabled = false` to disable the media worker and display. With a
+Set `media.enabled = false` to disable the media worker and display.
+`media.max_chars` accepts values from 1 to 256 and limits the combined
+artist/channel and title; the separator and ellipsis count toward the limit.
+Time, percentage and playback status do not count toward it. With a
 right-aligned clock, media uses the available space after workspaces and before
 the status group; `tasks.enabled` still requires a centered clock.
 

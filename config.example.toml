@@ -37,6 +37,7 @@ focused_foreground = "#FFB66EFF"
 
 [media]
 enabled = true
+max_chars = 40
 
 [tray]
 # Also sets the size of the weather, Bluetooth, clipboard, and network icons.

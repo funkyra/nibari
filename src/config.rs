@@ -139,11 +139,15 @@ impl Default for TasksConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct MediaConfig {
     pub enabled: bool,
+    pub max_chars: usize,
 }
 
 impl Default for MediaConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            max_chars: 40,
+        }
     }
 }
 
@@ -434,6 +438,9 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if !(1..=256).contains(&self.media.max_chars) {
+            bail!("media.max_chars must be in the range 1..=256");
+        }
         if !(1..=100).contains(&self.clipboard.max_items) {
             bail!("clipboard.max_items must be in the range 1..=100");
         }

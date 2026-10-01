@@ -43,21 +43,6 @@ fn unknown_duration_and_clamped_positions_are_explicit() {
 }
 
 #[test]
-fn title_is_limited_to_32_characters_without_limiting_artist() {
-    let now = Instant::now();
-    let mut players = HashMap::new();
-    let mut p = player(Status::Paused, 0, None, now);
-    let track = p.track.as_mut().unwrap();
-    track.artist = "A channel nickname that stays whole".into();
-    track.title = "123456789012345678901234567890123".into();
-    players.insert("spotify".into(), p);
-    assert_eq!(
-        snapshot(&players, now).unwrap().title,
-        "A channel nickname that stays whole - 1234567890123456789012345678901…"
-    );
-}
-
-#[test]
 fn selection_prefers_status_then_activity_with_stable_name_tie() {
     let now = Instant::now();
     let mut players = HashMap::new();
@@ -266,7 +251,9 @@ fn private_bus_signals_drive_media_without_position_polling() {
                 .await
                 .unwrap();
             let (sender, receiver) = smithay_client_toolkit::reexports::calloop::channel::channel();
-            let worker = tokio::spawn(async move { connected(connection, &sender).await });
+            let worker = tokio::spawn(async move {
+                connected(connection, &sender, Config::default().media.max_chars).await
+            });
             let initial = wait_snapshot(&receiver, Option::is_some).await.unwrap();
             assert_eq!(initial.title, "Fixture artist - Fixture song");
             assert_eq!(initial.detail, "00:49 / 02:40 (31%) [Paused]");
@@ -373,7 +360,9 @@ fn private_bus_failed_player_recovers_on_event_and_invalid_metadata_disappears()
                 .await
                 .unwrap();
             let (sender, receiver) = smithay_client_toolkit::reexports::calloop::channel::channel();
-            let worker = tokio::spawn(async move { connected(connection, &sender).await });
+            let worker = tokio::spawn(async move {
+                connected(connection, &sender, Config::default().media.max_chars).await
+            });
             tokio::time::sleep(Duration::from_millis(1100)).await;
             assert!(
                 receiver.try_recv().is_err(),

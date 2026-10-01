@@ -35,7 +35,8 @@ pub struct MediaHandle {
 }
 
 impl MediaHandle {
-    pub fn spawn(events: UiSender<Option<Arc<MediaSnapshot>>>, _config: &Config) -> Self {
+    pub fn spawn(events: UiSender<Option<Arc<MediaSnapshot>>>, config: &Config) -> Self {
+        let max_chars = config.media.max_chars;
         let (stop, mut stopped) = oneshot::channel();
         thread::Builder::new().name("nibari-media".into()).spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -44,7 +45,7 @@ impl MediaHandle {
                 loop {
                     let work = async {
                         let connection = timeout(Duration::from_secs(3), Connection::session()).await??;
-                        connected(connection, &events).await
+                        connected(connection, &events, max_chars).await
                     };
                     tokio::select! {
                         _ = &mut stopped => break,
@@ -293,30 +294,35 @@ fn selected(players: &HashMap<String, Player>) -> Option<(&str, &Player)> {
         .map(|(name, player)| (name.as_str(), player))
 }
 
-fn snapshot(players: &HashMap<String, Player>, now: Instant) -> Option<Arc<MediaSnapshot>> {
+fn snapshot(
+    players: &HashMap<String, Player>,
+    now: Instant,
+    max_chars: usize,
+) -> Option<Arc<MediaSnapshot>> {
     let (_, player) = selected(players)?;
     let track = player.track.as_ref()?;
-    let title = match (track.artist.is_empty(), track.title.is_empty()) {
-        (false, false) => format!("{} - {}", track.artist, truncated_title(&track.title)),
-        (false, true) => track.artist.clone(),
-        _ => truncated_title(&track.title),
-    };
     Some(Arc::new(MediaSnapshot {
-        title,
+        title: truncated_title(&track.artist, &track.title, max_chars),
         detail: player.detail(now),
     }))
 }
 
-fn truncated_title(title: &str) -> String {
-    const LIMIT: usize = 32;
-    let mut chars = title.chars();
-    let mut visible = chars.by_ref().take(LIMIT).collect::<String>();
+fn truncated_title(artist: &str, title: &str, max_chars: usize) -> String {
+    let separator = if artist.is_empty() || title.is_empty() {
+        ""
+    } else {
+        " - "
+    };
+    let mut chars = [artist, separator, title].into_iter().flat_map(str::chars);
+    let capacity = artist
+        .len()
+        .saturating_add(separator.len())
+        .saturating_add(title.len())
+        .min(max_chars.saturating_mul(4));
+    let mut visible = String::with_capacity(capacity);
+    visible.extend(chars.by_ref().take(max_chars));
     if chars.next().is_some() {
-        let cut = visible
-            .char_indices()
-            .nth(LIMIT - 1)
-            .map_or(visible.len(), |(index, _)| index);
-        visible.truncate(cut);
+        visible.pop();
         visible.push('…');
     }
     visible
@@ -403,6 +409,7 @@ fn fetch(jobs: &mut JoinSet<Update>, connection: &Connection, name: &str, player
 async fn connected(
     connection: Connection,
     events: &UiSender<Option<Arc<MediaSnapshot>>>,
+    max_chars: usize,
 ) -> anyhow::Result<()> {
     // Subscribe before discovery: queued owner events supersede any in-flight discovery result.
     let mut owners = subscribe(
@@ -533,7 +540,7 @@ async fn connected(
         if !ticking {
             next_tick = now + Duration::from_secs(1);
         }
-        let current = snapshot(&players, now);
+        let current = snapshot(&players, now, max_chars);
         if current != last {
             events
                 .send(current.clone())

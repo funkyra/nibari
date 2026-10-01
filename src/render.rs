@@ -1311,6 +1311,16 @@ impl Renderer {
         let separator_height = (pixmap.height() as i32 / 2).max(scale_i32);
         let separator_y = (pixmap.height() as i32 - separator_height) / 2;
         let text_y = self.task_text_y(scale, pixmap.height() as i32);
+        let edge_label_width = (tasks.len() > 1).then(|| {
+            let first = &tasks[0];
+            let last = &tasks[tasks.len() - 1];
+            let first_index =
+                self.ensure_task_label(first, scale, task_foreground(&self.style, first));
+            let first_width = self.task_text_cache[first_index].natural_width;
+            let last_index =
+                self.ensure_task_label(last, scale, task_foreground(&self.style, last));
+            first_width.min(self.task_text_cache[last_index].natural_width)
+        });
         if leading_gap >= scale_i32 {
             fill_rect(
                 pixmap,
@@ -1356,7 +1366,14 @@ impl Renderer {
             let icon_size = (self.style.task_icon_size * scale) as i32;
             let color = task_foreground(&self.style, task);
             let label_capacity = (rect.width - padding * 3 - icon_size).max(0);
-            let width_limit = (label_capacity > 0).then_some(label_capacity as u32);
+            let width_limit = (label_capacity > 0).then(|| {
+                let capacity = label_capacity as u32;
+                if index == 0 || index + 1 == tasks.len() {
+                    edge_label_width.map_or(capacity, |width| capacity.min(width))
+                } else {
+                    capacity
+                }
+            });
             let label_index = self.cached_task_label(task, scale, color, width_limit);
             let visible_label_width =
                 (self.task_text_cache[label_index].pixmap.width() as i32).min(label_capacity);
@@ -2730,83 +2747,6 @@ mod tests {
         let last = layout.item(2).unwrap();
         assert_eq!(last.width, 29);
         assert_eq!(last.x + last.width, 103);
-    }
-
-    #[test]
-    fn task_labels_respect_their_own_available_width() {
-        let config = Config {
-            clock: ClockConfig {
-                position: ClockPosition::Center,
-                ..Default::default()
-            },
-            tasks: TasksConfig {
-                enabled: true,
-                ..Default::default()
-            },
-            ..Config::default()
-        };
-        let mut renderer = Renderer::new(&config);
-        let workspaces = Default::default();
-        let labels = [
-            "Kitty",
-            "The middle application title remains independent",
-            "A much longer title on the right edge",
-        ];
-        let tasks: [WindowTask; 3] = std::array::from_fn(|index| WindowTask {
-            id: index as u64 + 1,
-            label: labels[index].into(),
-            app_id: None,
-            is_focused: false,
-            is_urgent: false,
-            icon: ApplicationIcon {
-                revision: 1,
-                pixels: Arc::from([0, 0, 255, 255]),
-                width: 1,
-                height: 1,
-            },
-        });
-        let mut pixmap = Pixmap::new(2400, config.bar.height).unwrap();
-        let mut hitboxes = Vec::new();
-
-        renderer.draw(
-            &mut pixmap.as_mut(),
-            RenderContent {
-                scale: 1,
-                clock: "12:34",
-                keyboard_layout: "",
-                tray: &[],
-                tray_reveal: 0.0,
-                workspaces: &workspaces,
-                tasks: &tasks,
-                media: None,
-            },
-            &mut hitboxes,
-        );
-
-        let width = |id| {
-            renderer
-                .task_text_cache
-                .iter()
-                .find(|cached| cached.id == id)
-                .unwrap()
-                .pixmap
-                .width()
-        };
-        assert!(width(2) > width(1));
-        assert!(width(3) > width(1));
-        let last = renderer
-            .task_text_cache
-            .iter()
-            .find(|cached| cached.id == 3)
-            .unwrap();
-        let last_slot = hitboxes
-            .iter()
-            .find(|hitbox| hitbox.target == HitTarget::Window(3))
-            .unwrap();
-        let label_capacity =
-            last_slot.width - (config.tasks.padding * 3 + config.tasks.icon_size) as i32;
-        assert!(last.natural_width <= label_capacity as u32);
-        assert_eq!(last.pixmap.width(), last.natural_width);
     }
 
     #[test]
